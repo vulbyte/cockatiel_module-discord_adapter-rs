@@ -1,0 +1,19 @@
+# Rust
+/target/
+Cargo.lock
+
+# Secrets / runtime config — never commit
+config.json
+.env
+.env.local
+discord_adapter.json
+
+# Database / logs
+*.db
+*.log
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/

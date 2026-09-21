@@ -1,0 +1,52 @@
+{
+  "autostart": true,
+  "binary": {
+    "linux": {
+      "aarch64": "target/release/discord-adapter-rs",
+      "arm": "target/release/discord-adapter-rs",
+      "x86_64": "target/release/discord-adapter-rs"
+    },
+    "macos": {
+      "aarch64": "target/release/discord-adapter-rs",
+      "arm": "target/release/discord-adapter-rs",
+      "x86_64": "target/release/discord-adapter-rs"
+    },
+    "windows": {
+      "aarch64": "target/release/discord-adapter-rs.exe",
+      "arm": "target/release/discord-adapter-rs.exe",
+      "x86_64": "target/release/discord-adapter-rs.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ],
+  "capabilities": "input",
+  "command_flags": [
+    "--release"
+  ],
+  "credentials": [
+    {
+      "env": "DISCORD_BOT_TOKEN",
+      "key": "bot_token",
+      "label": "Bot Token (discord.com/developers)",
+      "list": false,
+      "optional": false,
+      "sensitive": true
+    },
+    {
+      "env": "",
+      "key": "servers",
+      "label": "Servers (guild_id=ch1,ch2 or guild_id=*, one per line)",
+      "list": true,
+      "optional": false,
+      "sensitive": false
+    }
+  ],
+  "description": "reads + sends Discord chat and mod commands. Needs a bot token + Server ID (enable the Message Content intent and invite the bot with Read/Send/Moderate perms).",
+  "launch_command": "cargo run",
+  "name": "discord-adapter",
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
+}
