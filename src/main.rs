@@ -89,6 +89,8 @@ struct DiscordAdapterConfig {
     bot_token: Option<String>,
     #[serde(default)]
     servers: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    embed_sends: bool,
 }
 
 fn load_adapter_config() -> Option<DiscordAdapterConfig> {
@@ -129,7 +131,27 @@ fn load_adapter_config() -> Option<DiscordAdapterConfig> {
         _ => legacy_token,
     };
 
-    Some(DiscordAdapterConfig { bot_token: Some(bot_token), servers })
+    // Public toggle: post SendToPlatforms as an embed. If the value isn't in
+    // config.json yet, write the default (false) so the setting always exists.
+    let embed_sends = saved.get("embed_sends").and_then(|v| v.as_bool()).unwrap_or_else(|| {
+        if let Ok(data) = std::fs::read_to_string("config.json") {
+            if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(obj) = root.as_object_mut() {
+                    if let Some(ms) = obj
+                        .entry("module_specific".to_string())
+                        .or_insert_with(|| serde_json::json!({}))
+                        .as_object_mut()
+                    {
+                        ms.entry("embed_sends".to_string()).or_insert_with(|| serde_json::json!(false));
+                    }
+                    let _ = std::fs::write("config.json", serde_json::to_string_pretty(&root).unwrap());
+                }
+            }
+        }
+        false
+    });
+
+    Some(DiscordAdapterConfig { bot_token: Some(bot_token), servers, embed_sends })
         .filter(|c| !c.bot_token.as_deref().unwrap_or("").is_empty())
 }
 
@@ -204,12 +226,36 @@ fn parse_mod_command(message: &str, author: &str) -> Option<(String, serde_json:
         if target.is_empty() {
             return None;
         }
+        // Discord bans are permanent — a timed ban (`!ban @user -d 300`) is a
+        // timeout instead (matches how the engine's mod_timeout works).
+        let mut duration_secs: Option<i64> = None;
+        let mut reason = rest.trim().to_string();
+        if let Some(dpos) = reason.find("-d") {
+            let after = reason[dpos + 2..].trim();
+            let (num, _) = after.split_once(char::is_whitespace).unwrap_or((after, ""));
+            if let Ok(secs) = num.parse::<i64>() {
+                duration_secs = Some(secs.max(1));
+                reason = format!("{}{}", reason[..dpos].trim(), after[num.len()..].trim());
+            }
+        }
+        if let Some(duration_secs) = duration_secs {
+            return Some((
+                "mod_timeout".to_string(),
+                serde_json::json!({
+                    "platform": "discord",
+                    "handle": target,
+                    "duration_secs": duration_secs,
+                    "reason": reason,
+                    "actor": { "platform": "discord", "handle": author },
+                }),
+            ));
+        }
         return Some((
             "mod_ban".to_string(),
             serde_json::json!({
                 "platform": "discord",
                 "handle": target,
-                "reason": rest.trim().to_string(),
+                "reason": reason,
                 "actor": { "platform": "discord", "handle": author },
             }),
         ));
@@ -262,8 +308,15 @@ async fn send_discord_message(
     token: &str,
     channel_id: &str,
     msg: &str,
+    embed: bool,
 ) -> Result<(), String> {
-    let body = json!({ "content": msg });
+    // `embed_sends: true` posts a discordjs-style embed instead of a plain
+    // message (ROADMAP: "receive a Send and post as an embed").
+    let body = if embed {
+        json!({ "embeds": [{ "description": msg }] })
+    } else {
+        json!({ "content": msg })
+    };
     let resp = client
         .post(format!("{}/channels/{}/messages", REST_API, channel_id))
         .bearer_auth(token)
@@ -853,6 +906,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Send state for the read task, populated once config resolves.
     let send_token: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let send_channels: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let send_embed: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     // Channel carrying PromptResponses from the engine to the config loop, so
     // `prompt_for_input` can await the operator's typed answer.
@@ -862,6 +916,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let token_state = send_token.clone();
         let channels_state = send_channels.clone();
+        let embed_state = send_embed.clone();
         let http = http.clone();
         let engine_write = engine_write.clone();
         let auth_token = auth_token.clone();
@@ -895,13 +950,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Payload::SendToPlatforms(send) => {
                         let token = token_state.lock().await.clone();
                         let channels = channels_state.lock().await.clone();
+                        let embed = *embed_state.lock().await;
                         // Send to every monitored channel.
                         if channels.is_empty() {
                             warn!("SendToPlatforms received but no channels configured to send to.");
                             continue;
                         }
                         for ch in &channels {
-                            match send_discord_message(&http, &token, ch, &send.msg).await {
+                            match send_discord_message(&http, &token, ch, &send.msg, embed).await {
                                 Ok(()) => info!("Sent to Discord channel {}: {}", ch, send.msg),
                                 Err(e) => error!("SendToPlatforms failed on {}: {}", ch, e),
                             }
@@ -969,6 +1025,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // READY and synced by the gateway).
     *send_token.lock().await = bot_token.clone();
     *send_channels.lock().await = all_send_channels(&servers);
+    let embed_sends = load_adapter_config().map(|c| c.embed_sends).unwrap_or(false);
+    *send_embed.lock().await = embed_sends;
 
     // Discord gateway task.
     info!("Connecting to Discord gateway...");
@@ -990,7 +1048,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{all_send_channels, parse_servers, ServerChannels, extract_image_urls};
+    use super::{all_send_channels, parse_servers, ServerChannels, extract_image_urls, parse_mod_command};
     use serde_json::json;
 
     #[test]
@@ -1049,5 +1107,22 @@ mod tests {
             "content": "hello"
         });
         assert!(extract_image_urls(&msg).is_empty());
+    }
+
+    #[test]
+    fn ban_with_duration_routes_to_timeout() {
+        // Discord bans are permanent — `!ban @user -d 300` must become a
+        // mod_timeout so the engine can unban later.
+        let (qid, payload) = parse_mod_command("!ban @user -d 300 spamming", "mod").unwrap();
+        assert_eq!(qid, "mod_timeout");
+        assert_eq!(payload["duration_secs"], 300);
+        assert_eq!(payload["handle"], "user");
+        assert_eq!(payload["reason"], "spamming");
+        assert_eq!(payload["actor"]["handle"], "mod");
+
+        // Plain ban stays a permanent mod_ban.
+        let (qid, payload) = parse_mod_command("!ban @user being awful", "mod").unwrap();
+        assert_eq!(qid, "mod_ban");
+        assert_eq!(payload["reason"], "being awful");
     }
 }
