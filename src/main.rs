@@ -749,6 +749,7 @@ async fn handle_message_create(
             raw_message: raw_message.clone(),
             user_uuid7: author.to_string(),
             command: None,
+            channel_id: channel_id.to_string(),
             user_data: None,
         }),
     };
@@ -965,12 +966,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let token = token_state.lock().await.clone();
                         let channels = channels_state.lock().await.clone();
                         let embed = *embed_state.lock().await;
-                        // Send to every monitored channel.
-                        if channels.is_empty() {
-                            warn!("SendToPlatforms received but no channels configured to send to.");
+                        // Target a single channel when the sender specified one
+                        // (e.g. engine !help / invalid-command replies); else
+                        // send to every monitored channel.
+                        let targets: Vec<&String> = if !send.channel_id.is_empty() {
+                            channels.iter().filter(|c| **c == send.channel_id).collect()
+                        } else {
+                            channels.iter().collect()
+                        };
+                        if targets.is_empty() {
+                            warn!("SendToPlatforms received but no matching channel configured.");
                             continue;
                         }
-                        for ch in &channels {
+                        for ch in targets {
                             match send_discord_message(&http, &token, ch, &send.msg, embed).await {
                                 Ok(()) => info!("Sent to Discord channel {}: {}", ch, send.msg),
                                 Err(e) => error!("SendToPlatforms failed on {}: {}", ch, e),
