@@ -328,27 +328,111 @@ async fn send_discord_message(
     }
 }
 
+// ── Discord REST helpers (setup-time validation) ──────────────────────
+
+/// Verify the bot token: `GET /users/@me` must succeed.
+async fn check_discord_auth(client: &reqwest::Client, token: &str) -> bool {
+    match client
+        .get(format!("{}/users/@me", REST_API))
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// The server (guild) IDs the bot currently belongs to.
+async fn list_bot_guilds(client: &reqwest::Client, token: &str) -> Vec<String> {
+    let Ok(resp) = client
+        .get(format!("{}/users/@me/guilds", REST_API))
+        .bearer_auth(token)
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|g| g.get("id").and_then(|i| i.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The channel IDs the bot can see in a server (guild).
+async fn guild_channels(client: &reqwest::Client, token: &str, guild_id: &str) -> Vec<String> {
+    let Ok(resp) = client
+        .get(format!("{}/guilds/{}/channels", REST_API, guild_id))
+        .bearer_auth(token)
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.get("id").and_then(|i| i.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The operator's choice when a configured server/channel is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TieChoice {
+    /// Re-test the same id (the failure may be transient).
+    Retry,
+    /// Keep the entry but skip it for now (noted in the log).
+    Ignore,
+    /// Remove the entry from the config.
+    Remove,
+    /// Prompt for a replacement value, save it, and re-test.
+    Edit,
+}
+
+fn parse_tie_choice(answer: &str) -> Option<TieChoice> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "t" | "try" | "retry" | "try again" => Some(TieChoice::Retry),
+        "i" | "ignore" => Some(TieChoice::Ignore),
+        "r" | "remove" => Some(TieChoice::Remove),
+        "e" | "edit" => Some(TieChoice::Edit),
+        _ => None,
+    }
+}
+
+fn tie_choices_help() -> String {
+    "Enter one of: (t)ry again, (i)gnore, (r)emove, (e)dit".to_string()
+}
+
 // ── Discord gateway ───────────────────────────────────────────────────
 
 /// Connect to the Discord gateway, identify, heartbeat, and forward
-/// MESSAGE_CREATE events to the engine as preprocessed messages. When the bot
-/// token is rejected (op 9 / close 4004), it asks the operator for a fresh
-/// token via the prompt subwindow instead of retrying the bad token forever.
+/// MESSAGE_CREATE events to the engine as preprocessed messages. Receive-only:
+/// the token + servers/channels were resolved + validated in the linear setup
+/// phase, so this loop never prompts (no reconnect re-prompt spin).
+#[allow(clippy::too_many_arguments)]
 async fn run_discord_gateway(
     token: String,
     servers: std::collections::HashMap<String, ServerChannels>,
     member_cache: Arc<Mutex<HashMap<String, String>>>,
     engine_write: Arc<Mutex<WsWriteHalf>>,
-    send_token: Arc<Mutex<String>>,
     send_channels: Arc<Mutex<Vec<String>>>,
-    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
     auth_token: &str,
     module_name: &str,
     instance_uuid: &str,
 ) {
-    let mut servers = servers;
-    let mut token = token;
-    let mut auth_failures = 0u32;
     loop {
         let (mut ws, _) = match tokio_tungstenite::connect_async(GATEWAY_URL).await {
             Ok(c) => c,
@@ -412,12 +496,9 @@ async fn run_discord_gateway(
                                     "Discord gateway closed the connection: code={} reason={}",
                                     f.code, f.reason
                                 );
-                                // 4004/4005 = authentication failed — the saved
-                                // token is bad. Count it so the operator is
-                                // prompted for a fresh token instead of looping.
                                 let code: u16 = f.code.into();
                                 if code == 4004 || code == 4005 {
-                                    auth_failures += 1;
+                                    warn!("Discord rejected the bot token (auth failed) — the token was verified in setup; check the Developer Portal.");
                                 }
                             } else {
                                 warn!("Discord gateway closed the connection (no close frame)");
@@ -436,7 +517,6 @@ async fn run_discord_gateway(
                     // op 9 = Invalid Session (bad token / session expired).
                     if op == 9 {
                         warn!("Discord gateway reported an invalid session (op 9) — the bot token may be wrong.");
-                        auth_failures += 1;
                         break 'conn;
                     }
                     if op == 0 {
@@ -445,149 +525,17 @@ async fn run_discord_gateway(
                         match t {
                             "READY" => {
                                 info!("Discord gateway ready (bot: {}).", d.and_then(|x| x.get("user")).and_then(|u| u.get("username")).and_then(|u| u.as_str()).unwrap_or("?"));
-
-                                // READY carries `d.guilds` — every server the bot
-                                // belongs to. We monitor every configured server.
-                                let bot_guilds: Vec<String> = d
-                                    .and_then(|x| x.get("guilds"))
-                                    .and_then(|g| g.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|g| g.get("id").and_then(|i| i.as_str()))
-                                            .map(|s| s.to_string())
-                                            .collect()
+                                // Server/channel setup + validation happened in the
+                                // linear setup phase — the gateway is receive-only.
+                                let desc: Vec<String> = servers
+                                    .iter()
+                                    .map(|(g, p)| match p {
+                                        ServerChannels::All => format!("{}=[*]", g),
+                                        ServerChannels::Some(chs) => format!("{}={}", g, chs.join(",")),
                                     })
-                                    .unwrap_or_default();
-
-                                // Verify each configured server; drop invalid ones.
-                                if !servers.is_empty() {
-                                    let mut valid: std::collections::HashMap<String, ServerChannels> = Default::default();
-                                    for (guild, policy) in &servers {
-                                        if bot_guilds.contains(guild) {
-                                            valid.insert(guild.clone(), policy.clone());
-                                        } else {
-                                            error!(
-                                                "Discord bot is NOT in configured server {} — it can only access: [{}]. That server will be skipped.",
-                                                guild,
-                                                bot_guilds.join(", ")
-                                            );
-                                        }
-                                    }
-                                    if !valid.is_empty() {
-                                        servers = valid;
-                                        let _ = *send_channels.lock().await = all_send_channels(&servers);
-                                        let desc: Vec<String> = servers
-                                            .iter()
-                                            .map(|(g, p)| match p {
-                                                ServerChannels::All => format!("{}=[*]", g),
-                                                ServerChannels::Some(chs) => format!("{}={}", g, chs.join(",")),
-                                            })
-                                            .collect();
-                                        info!("Monitoring servers: {}", desc.join(" · "));
-                                    } else {
-                                        // Every configured server is invalid — drop
-                                        // them and prompt for a fresh selection.
-                                        servers = Default::default();
-                                    }
-                                }
-
-                                // No servers configured (first launch or all invalid):
-                                // ask the operator which server(s) + channels to monitor.
-                                if servers.is_empty() {
-                                    let mut accessible_list = String::new();
-                                    for (i, g) in bot_guilds.iter().enumerate() {
-                                        accessible_list.push_str(&format!("  {}: {}\n", i + 1, g));
-                                    }
-                                    let accessible = if bot_guilds.is_empty() {
-                                        "  (none — the bot has no server access at all)".to_string()
-                                    } else {
-                                        accessible_list.trim_end().to_string()
-                                    };
-
-                                    // 1) Pick a server.
-                                    if let Some(choice) = prompt_for_input(
-                                        &engine_write,
-                                        prompt_rx,
-                                        auth_token,
-                                        module_name,
-                                        instance_uuid,
-                                        "Choose the Discord Server",
-                                        &format!(
-                                            "Your bot can currently only access these servers:\n{}\n\n\
-                                             Enter the NUMBER of a server above (e.g. 1), or paste a Server (Guild) ID directly.\n\n\
-                                             To find a Server ID: Settings > Advanced > Developer Mode >\n\
-                                             right-click the server name > Copy Server ID.\n\n\
-                                             Leave empty (or press Cancel) to keep retrying.",
-                                            accessible
-                                        ),
-                                        "Server number or Guild ID",
-                                        PromptKind::String,
-                                        300,
-                                    )
-                                    .await
-                                    {
-                                        let trimmed = choice.trim().to_string();
-                                        let mut new_guild = String::new();
-                                        if trimmed.is_empty() || trimmed == "0" {
-                                            warn!("No server selected — keeping current setting and retrying.");
-                                        } else if let Ok(idx) = trimmed.parse::<usize>() {
-                                            if idx >= 1 && idx <= bot_guilds.len() {
-                                                new_guild = bot_guilds[idx - 1].clone();
-                                                info!("Discord Server ID set to {} (selection {}).", new_guild, idx);
-                                            } else {
-                                                warn!("Server number {} is out of range (1..={}). Keeping current setting.", idx, bot_guilds.len());
-                                            }
-                                        } else {
-                                            new_guild = trimmed.clone();
-                                            info!("Discord Server ID set to {} (pasted).", new_guild);
-                                        }
-
-                                        // 2) Channels for that server (empty = all).
-                                        if !new_guild.is_empty() {
-                                            let mut chs: Vec<String> = Vec::new();
-                                            if let Some(ch_choice) = prompt_for_input(
-                                                &engine_write,
-                                                prompt_rx,
-                                                auth_token,
-                                                module_name,
-                                                instance_uuid,
-                                                "Discord Channels",
-                                                "Which channels should the bot monitor in this server?\n\n\
-                                                 Enter channel IDs separated by commas (e.g. 123,456,789).\n\
-                                                 Leave empty to monitor ALL channels in the selected server.",
-                                                "Channel IDs (comma-separated, empty = all)",
-                                                PromptKind::String,
-                                                300,
-                                            )
-                                            .await
-                                            {
-                                                let tc = ch_choice.trim();
-                                                if !tc.is_empty() {
-                                                    chs = tc.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
-                                                }
-                                            }
-                                            let policy = if chs.is_empty() {
-                                                ServerChannels::All
-                                            } else {
-                                                ServerChannels::Some(chs)
-                                            };
-                                            servers.insert(new_guild, policy);
-                                        }
-                                    }
-
-                                    if !servers.is_empty() {
-                                        save_adapter_config(&token, &servers);
-                                        let _ = *send_channels.lock().await = all_send_channels(&servers);
-                                        info!("Discord configuration updated: {} server(s) (reconnecting...)", servers.len());
-                                        break 'conn;
-                                    } else {
-                                        // No server chosen — back off so we don't
-                                        // re-prompt every few seconds in a loop.
-                                        warn!("No Discord server configured yet — retrying in 60s.");
-                                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                                        break 'conn;
-                                    }
-                                }
+                                    .collect();
+                                let _ = *send_channels.lock().await = all_send_channels(&servers);
+                                info!("Monitoring servers: {}", desc.join(" · "));
                             }
                             "MESSAGE_CREATE" => {
                                 if let Some(d) = d {
@@ -612,38 +560,6 @@ async fn run_discord_gateway(
 
         warn!("Discord gateway disconnected. Reconnecting in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-        // Repeated auth failures mean the saved token is bad — ask the operator
-        // for a fresh one via the prompt subwindow instead of looping forever.
-        if auth_failures >= 2 {
-            auth_failures = 0;
-            info!("Prompting for a new Discord bot token (previous token was rejected)...");
-            if let Some(new_token) = prompt_for_input(
-                &engine_write,
-                prompt_rx,
-                auth_token,
-                module_name,
-                instance_uuid,
-                "Discord Bot Token Required",
-                "Discord rejected the current bot token (invalid session / authentication failed).\n\n\
-                 Paste a valid bot token from the Discord Developer Portal\n\
-                 (discord.com/developers > your app > Bot > Reset Token).\n\n\
-                 The token is masked so it never shows on screen.",
-                "Bot Token",
-                PromptKind::Credential,
-                300,
-            )
-            .await
-            {
-                let trimmed = new_token.trim().to_string();
-                if !trimmed.is_empty() {
-                    token = trimmed.clone();
-                    *send_token.lock().await = token.clone();
-                    save_adapter_config(&token, &servers);
-                    info!("Discord bot token updated.");
-                }
-            }
-        }
     }
 }
 
@@ -836,6 +752,315 @@ async fn prompt_for_input(
     None
 }
 
+// ── Linear setup phase ────────────────────────────────────────────────
+// Resolve the bot token (prompt + verify) and the server→channel map
+// (validate every entry with the t/i/r/e choices) BEFORE the receive loop,
+// so the gateway never re-prompts in a reconnect loop.
+
+async fn resolve_auth(
+    client: &reqwest::Client,
+    engine_write: &Arc<Mutex<WsWriteHalf>>,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    mut bot_token: String,
+) -> String {
+    loop {
+        if !bot_token.is_empty() {
+            if check_discord_auth(client, &bot_token).await {
+                return bot_token;
+            }
+            warn!("Discord rejected the stored bot token — prompting for a fresh one.");
+            bot_token.clear();
+        }
+        if let Some(val) = prompt_for_input(
+            engine_write,
+            prompt_rx,
+            auth_token,
+            module_name,
+            instance_uuid,
+            "Discord Bot Token Required",
+            &setup_guide_text(),
+            "Bot Token",
+            PromptKind::Credential,
+            120,
+        )
+        .await
+        {
+            let t = val.trim().to_string();
+            if !t.is_empty() {
+                bot_token = t;
+                cockatiel_client::write_env_file(".env", &[("DISCORD_BOT_TOKEN", &bot_token)]);
+            }
+        }
+        // Cancelled / empty — pause so a silent operator doesn't make us spin.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Ask the operator how to handle an invalid entry: (t)ry / (i)gnore /
+/// (r)emove / (e)dit. Reprompts until a valid choice (or None on cancel).
+async fn prompt_tie_choice(
+    engine_write: &Arc<Mutex<WsWriteHalf>>,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    subject: &str,
+) -> Option<TieChoice> {
+    loop {
+        let answer = prompt_for_input(
+            engine_write,
+            prompt_rx,
+            auth_token,
+            module_name,
+            instance_uuid,
+            "Invalid Discord Entry",
+            &format!("{}\n\n{}", subject, tie_choices_help()),
+            "t / i / r / e",
+            PromptKind::String,
+            300,
+        )
+        .await;
+        match answer.as_deref().and_then(parse_tie_choice) {
+            Some(c) => return Some(c),
+            None if answer.is_some() => {
+                warn!("Unrecognized choice — expected t / i / r / e.");
+            }
+            None => return None, // cancelled
+        }
+    }
+}
+
+/// No servers configured (or all were invalid): pick one from the bot's guilds
+/// + choose its channels (empty = all).
+async fn pick_server_and_channels(
+    client: &reqwest::Client,
+    token: &str,
+    engine_write: &Arc<Mutex<WsWriteHalf>>,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+) -> Option<(String, ServerChannels)> {
+    let bot_guilds = list_bot_guilds(client, token).await;
+    if bot_guilds.is_empty() {
+        warn!("The bot has no server access at all — cannot configure servers.");
+        return None;
+    }
+    let mut accessible_list = String::new();
+    for (i, g) in bot_guilds.iter().enumerate() {
+        accessible_list.push_str(&format!("  {}: {}\n", i + 1, g));
+    }
+    let guild = loop {
+        let answer = prompt_for_input(
+            engine_write,
+            prompt_rx,
+            auth_token,
+            module_name,
+            instance_uuid,
+            "Choose the Discord Server",
+            &format!(
+                "Your bot can currently only access these servers:\n{}\n\n\
+                 Enter the NUMBER of a server above (e.g. 1), or paste a Server (Guild) ID directly.",
+                accessible_list.trim_end()
+            ),
+            "Server number or Guild ID",
+            PromptKind::String,
+            300,
+        )
+        .await?;
+        let trimmed = answer.trim().to_string();
+        if let Ok(idx) = trimmed.parse::<usize>() {
+            if idx >= 1 && idx <= bot_guilds.len() {
+                break bot_guilds[idx - 1].clone();
+            }
+            warn!("Server number {} is out of range (1..={}).", idx, bot_guilds.len());
+        } else if !trimmed.is_empty() && bot_guilds.contains(&trimmed) {
+            break trimmed;
+        } else if !trimmed.is_empty() {
+            warn!("'{}' is not in the bot's accessible servers.", trimmed);
+        }
+    };
+
+    let channels = prompt_for_input(
+        engine_write,
+        prompt_rx,
+        auth_token,
+        module_name,
+        instance_uuid,
+        "Discord Channels",
+        "Which channels should the bot monitor in this server?\n\n\
+         Enter channel IDs separated by commas (e.g. 123,456,789).\n\
+         Leave empty to monitor ALL channels in the selected server.",
+        "Channel IDs (comma-separated, empty = all)",
+        PromptKind::String,
+        300,
+    )
+    .await;
+    let policy = match channels.as_deref().map(str::trim) {
+        Some(tc) if !tc.is_empty() => {
+            let ids: Vec<String> = tc.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+            if ids.is_empty() {
+                ServerChannels::All
+            } else {
+                ServerChannels::Some(ids)
+            }
+        }
+        _ => ServerChannels::All,
+    };
+    Some((guild, policy))
+}
+
+/// Validate every configured server + channel against the Discord API, applying
+/// the t/i/r/e choices to anything invalid. Returns the final map + the log to
+/// surface to the operator.
+async fn resolve_servers(
+    client: &reqwest::Client,
+    token: &str,
+    engine_write: &Arc<Mutex<WsWriteHalf>>,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    mut servers: std::collections::HashMap<String, ServerChannels>,
+) -> (std::collections::HashMap<String, ServerChannels>, String) {
+    let bot_guilds = list_bot_guilds(client, token).await;
+    let mut log = String::new();
+
+    if servers.is_empty() {
+        if let Some((guild, policy)) = pick_server_and_channels(
+            client, token, engine_write, prompt_rx, auth_token, module_name, instance_uuid,
+        )
+        .await
+        {
+            servers.insert(guild.clone(), policy);
+            log.push_str(&format!("configured server {} to monitor\n", guild));
+        } else {
+            log.push_str("no server configured — the bot will idle until configured\n");
+        }
+    } else {
+        let mut final_servers: std::collections::HashMap<String, ServerChannels> = Default::default();
+        for (guild, policy) in &servers {
+            if !bot_guilds.contains(guild) {
+                // The bot isn't in this server — ask the operator.
+                let subject = format!("Server {} is NOT in the bot's accessible servers.", guild);
+                let choice = prompt_tie_choice(engine_write, prompt_rx, auth_token, module_name, instance_uuid, &subject).await;
+                match choice {
+                    Some(TieChoice::Retry) => {
+                        if list_bot_guilds(client, token).await.contains(guild) {
+                            final_servers.insert(guild.clone(), policy.clone());
+                            log.push_str(&format!("server {} valid on retry\n", guild));
+                        } else {
+                            log.push_str(&format!("server {} still invalid on retry — skipped\n", guild));
+                        }
+                    }
+                    Some(TieChoice::Ignore) => {
+                        final_servers.insert(guild.clone(), policy.clone());
+                        log.push_str(&format!("server {} invalid — ignored (keeping)\n", guild));
+                    }
+                    Some(TieChoice::Remove) => {
+                        log.push_str(&format!("server {} invalid — removed\n", guild));
+                    }
+                    Some(TieChoice::Edit) => {
+                        if let Some(new_id) = prompt_for_input(
+                            engine_write, prompt_rx, auth_token, module_name, instance_uuid,
+                            "Edit Server ID",
+                            "Paste the correct Server (Guild) ID.",
+                            "Server ID", PromptKind::String, 300,
+                        )
+                        .await
+                        {
+                            let t = new_id.trim().to_string();
+                            if bot_guilds.contains(&t) {
+                                final_servers.insert(t.clone(), policy.clone());
+                                log.push_str(&format!("server {} edited to {} (valid)\n", guild, t));
+                            } else {
+                                log.push_str(&format!("server {} edited to {} — still not in the bot's servers\n", guild, t));
+                            }
+                        } else {
+                            log.push_str(&format!("server {} edit cancelled — removed\n", guild));
+                        }
+                    }
+                    None => {
+                        log.push_str(&format!("server {} invalid — skipped (cancelled)\n", guild));
+                    }
+                }
+            } else {
+                match policy {
+                    ServerChannels::All => {
+                        final_servers.insert(guild.clone(), ServerChannels::All);
+                        log.push_str(&format!("server {} is valid (all channels)\n", guild));
+                    }
+                    ServerChannels::Some(chs) => {
+                        let channel_ids = guild_channels(client, token, guild).await;
+                        let mut kept: Vec<String> = Vec::new();
+                        for c in chs {
+                            if channel_ids.contains(c) {
+                                kept.push(c.clone());
+                                log.push_str(&format!("channel {} in {} is valid, testing next\n", c, guild));
+                                continue;
+                            }
+                            // Invalid channel — ask the operator (t/i/r/e).
+                            let subject = format!("Channel {} in server {} is NOT a valid channel.", c, guild);
+                            let choice = prompt_tie_choice(engine_write, prompt_rx, auth_token, module_name, instance_uuid, &subject).await;
+                            match choice {
+                                Some(TieChoice::Retry) => {
+                                    if guild_channels(client, token, guild).await.contains(c) {
+                                        kept.push(c.clone());
+                                        log.push_str(&format!("channel {} retried — valid\n", c));
+                                    } else {
+                                        log.push_str(&format!("channel {} retried — still invalid\n", c));
+                                    }
+                                }
+                                Some(TieChoice::Ignore) => {
+                                    kept.push(c.clone());
+                                    log.push_str(&format!("channel {} invalid — ignored (keeping)\n", c));
+                                }
+                                Some(TieChoice::Remove) => {
+                                    log.push_str(&format!("channel {} invalid — removed\n", c));
+                                }
+                                Some(TieChoice::Edit) => {
+                                    if let Some(new_id) = prompt_for_input(
+                                        engine_write, prompt_rx, auth_token, module_name, instance_uuid,
+                                        "Edit Channel ID",
+                                        "Paste the correct channel ID.",
+                                        "Channel ID", PromptKind::String, 300,
+                                    )
+                                    .await
+                                    {
+                                        let t = new_id.trim().to_string();
+                                        if !t.is_empty() && guild_channels(client, token, guild).await.contains(&t) {
+                                            kept.push(t.clone());
+                                            log.push_str(&format!("channel {} edited to {} (valid)\n", c, t));
+                                        } else {
+                                            log.push_str(&format!("channel {} edited to {} — still invalid\n", c, t));
+                                        }
+                                    } else {
+                                        log.push_str(&format!("channel {} edit cancelled — removed\n", c));
+                                    }
+                                }
+                                None => {
+                                    log.push_str(&format!("channel {} invalid — skipped (cancelled)\n", c));
+                                }
+                            }
+                        }
+                        if kept.is_empty() {
+                            log.push_str(&format!("server {} has no valid channels — removed\n", guild));
+                        } else {
+                            final_servers.insert(guild.clone(), ServerChannels::Some(kept));
+                        }
+                    }
+                }
+            }
+        }
+        servers = final_servers;
+    }
+    save_adapter_config(token, &servers);
+    (servers, log)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Log to stderr WITHOUT ANSI codes: when the TUI pipes module stdout it
@@ -1022,71 +1247,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // ── Config phase ───────────────────────────────────────────────────
-    // Only the bot token is required here. The server→channel map is loaded
-    // from config.json (and finalized/validated at READY time).
-    if bot_token.is_empty() {
-        if let Some(saved) = load_adapter_config() {
-            if let Some(st) = saved.bot_token {
-                if !st.is_empty() {
-                    bot_token = st;
-                }
-            }
-            servers = parse_servers(&saved.servers);
+    // ── Linear setup phase ────────────────────────────────────────────────
+    // Auth: prompt for a token if missing, verify it against the Discord API.
+    let http_setup = reqwest::Client::new();
+    let bot_token = resolve_auth(
+        &http_setup,
+        &engine_write,
+        &mut prompt_rx,
+        &auth_token,
+        &module_name,
+        &instance_uuid,
+        bot_token,
+    )
+    .await;
+
+    // Servers: validate every configured server + channel (t/i/r/e on invalid),
+    // or pick a server + channels when none are configured.
+    let (servers, setup_log) = resolve_servers(
+        &http_setup,
+        &bot_token,
+        &engine_write,
+        &mut prompt_rx,
+        &auth_token,
+        &module_name,
+        &instance_uuid,
+        servers,
+    )
+    .await;
+
+    // Surface the setup summary to the operator (the accumulated log).
+    if !setup_log.trim().is_empty() {
+        let log = Container {
+            version: 1,
+            auth_token: auth_token.clone(),
+            module_name: module_name.clone(),
+            module_instance_uuid7: instance_uuid.clone(),
+            payload: Some(Payload::Log(cockatiel_client::proto::Log {
+                log: format!("[discord-adapter] setup:\n{}", setup_log.trim_end()),
+                blob: vec![],
+            })),
+        };
+        let mut lbuf = Vec::new();
+        if log.encode(&mut lbuf).is_ok() {
+            let mut w = engine_write.lock().await;
+            let _ = w.send(WsMessage::Binary(lbuf.into())).await;
         }
     }
 
-    if bot_token.is_empty() {
-        // Prompt for the bot token (masked credential).
-        if let Some(val) = prompt_for_input(
-            &engine_write,
-            &mut prompt_rx,
-            &auth_token,
-            &module_name,
-            &instance_uuid,
-            "Discord Bot Token Required",
-            &setup_guide_text(),
-            "Bot Token",
-            PromptKind::Credential,
-            120,
-        )
-        .await
-        {
-            bot_token = val.trim().to_string();
-        }
-
-        // Fallback: if the operator cancelled, keep polling config.json so the
-        // TUI can still supply a token via file.
-        while bot_token.is_empty() {
-            if let Some(saved) = load_adapter_config() {
-                if let Some(st) = saved.bot_token {
-                    if !st.is_empty() {
-                        bot_token = st;
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    }
-
-    // Publish the token to the read task (servers/channels are finalized at
-    // READY and synced by the gateway).
+    // Publish the resolved token/channels to the read task.
     *send_token.lock().await = bot_token.clone();
     *send_channels.lock().await = all_send_channels(&servers);
     let embed_sends = load_adapter_config().map(|c| c.embed_sends).unwrap_or(false);
     *send_embed.lock().await = embed_sends;
 
-    // Discord gateway task.
+    // Discord gateway task — receive-only (all setup/validation happened above).
     info!("Connecting to Discord gateway...");
     run_discord_gateway(
         bot_token,
         servers,
         member_cache,
         engine_write,
-        send_token,
         send_channels,
-        &mut prompt_rx,
         &auth_token,
         &module_name,
         &instance_uuid,
@@ -1097,8 +1318,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{all_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query};
+    use super::{all_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice};
     use serde_json::json;
+
+    #[test]
+    fn tie_choice_parses_all_options() {
+        assert_eq!(parse_tie_choice("t"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("try again"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("i"), Some(TieChoice::Ignore));
+        assert_eq!(parse_tie_choice("r"), Some(TieChoice::Remove));
+        assert_eq!(parse_tie_choice("e"), Some(TieChoice::Edit));
+        assert_eq!(parse_tie_choice("EDIT"), Some(TieChoice::Edit));
+        assert_eq!(parse_tie_choice("x"), None);
+        assert_eq!(parse_tie_choice(""), None);
+    }
 
     #[test]
     fn parses_multi_server_config() {
