@@ -764,28 +764,6 @@ async fn handle_message_create(
         let mut write = engine_write.lock().await;
         let _ = write.send(WsMessage::Binary(buf.into())).await;
     }
-
-    // Handle moderator commands (!ban / !timeout).
-    if let Some((qid, payload)) = parse_mod_command(&content, author) {
-        info!("Mod command detected: {} target={}", qid, payload);
-        // Resolve a mention target (id) to a cached username if possible.
-        let query = Container {
-            version: 1,
-            auth_token: auth_token.to_string(),
-            module_name: module_name.to_string(),
-            module_instance_uuid7: instance_uuid.to_string(),
-            payload: Some(Payload::DatabaseQuery(DatabaseQuery {
-                query_id: qid,
-                sql: payload.to_string(),
-                params: vec![],
-            })),
-        };
-        let mut qbuf = Vec::new();
-        if query.encode(&mut qbuf).is_ok() {
-            let mut write = engine_write.lock().await;
-            let _ = write.send(WsMessage::Binary(qbuf.into())).await;
-        }
-    }
 }
 
 // ── main ──────────────────────────────────────────────────────────────
@@ -900,6 +878,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (write, read) = cockatiel.stream.split();
 
     let engine_write: Arc<Mutex<WsWriteHalf>> = Arc::new(Mutex::new(write));
+
+    // Register the mod commands with the engine command system: the engine now
+    // parses `!ban` / `!timeout` and routes them back with the parsed Command.
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let commands = Container {
+            version: 1,
+            auth_token: auth_token.clone(),
+            module_name: module_name.clone(),
+            module_instance_uuid7: instance_uuid.clone(),
+            payload: Some(Payload::CommandsPayload(Commands {
+                commands: vec![
+                    Command {
+                        command_name: "ban".to_string(),
+                        command_flag: "!".to_string(),
+                        command_description: "ban a user".to_string(),
+                        command_flags: vec![],
+                    },
+                    Command {
+                        command_name: "timeout".to_string(),
+                        command_flag: "!".to_string(),
+                        command_description: "timeout a user".to_string(),
+                        command_flags: vec![],
+                    },
+                ],
+                alert_on_unknown_command: false,
+            })),
+        };
+        let mut cbuf = Vec::new();
+        use prost::Message;
+        if commands.encode(&mut cbuf).is_ok() {
+            let mut w = engine_write.lock().await;
+            let _ = w.send(WsMessage::Binary(cbuf.into())).await;
+        }
+        info!("registered !ban / !timeout commands");
+    }
     let member_cache: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let http = reqwest::Client::new();
 
@@ -966,6 +980,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Payload::PromptResponse(resp) => {
                         // Forward operator answers to the awaiting prompt.
                         let _ = prompt_tx.send(resp);
+                    }
+                    // Routed chat command: the engine parsed `!ban` / `!timeout`
+                    // and delivered it here with the parsed Command attached.
+                    Payload::MessagePreProcess(pre) => {
+                        let Some(chat) = pre.raw_message else { continue };
+                        let Some(cmd) = chat.command else { continue };
+                        if cmd.command_name != "ban" && cmd.command_name != "timeout" {
+                            continue;
+                        }
+                        let author = chat
+                            .user_data
+                            .as_ref()
+                            .map(|u| u.username.clone())
+                            .unwrap_or_default();
+                        if let Some((qid, payload)) = parse_mod_command(&chat.raw_message, &author) {
+                            let query = Container {
+                                version: 1,
+                                auth_token: auth_token.clone(),
+                                module_name: module_name.clone(),
+                                module_instance_uuid7: instance_uuid.clone(),
+                                payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                    query_id: qid,
+                                    sql: payload.to_string(),
+                                    params: vec![],
+                                })),
+                            };
+                            let mut qbuf = Vec::new();
+                            if query.encode(&mut qbuf).is_ok() {
+                                let mut w = engine_write.lock().await;
+                                let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                            }
+                        }
                     }
                     _ => {}
                 }
