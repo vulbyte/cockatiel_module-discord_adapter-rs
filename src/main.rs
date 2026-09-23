@@ -210,35 +210,76 @@ fn clean_target(raw: &str) -> String {
     t
 }
 
-/// Parse a moderator command (!ban / !timeout) from a chat message.
-/// Returns (query_id, payload_json). The actor (message author) is included.
-fn parse_mod_command(message: &str, author: &str) -> Option<(String, serde_json::Value)> {
-    let trimmed = message.trim();
-    let lower = trimmed.to_lowercase();
-
-    if lower.starts_with("!ban") {
-        let args = trimmed[5..].trim();
-        let (target, rest) = match args.split_once(char::is_whitespace) {
-            Some((t, r)) => (t, r),
-            None => (args, ""),
-        };
-        let target = clean_target(target);
-        if target.is_empty() {
-            return None;
-        }
-        // Discord bans are permanent — a timed ban (`!ban @user -d 300`) is a
-        // timeout instead (matches how the engine's mod_timeout works).
-        let mut duration_secs: Option<i64> = None;
-        let mut reason = rest.trim().to_string();
-        if let Some(dpos) = reason.find("-d") {
-            let after = reason[dpos + 2..].trim();
-            let (num, _) = after.split_once(char::is_whitespace).unwrap_or((after, ""));
-            if let Ok(secs) = num.parse::<i64>() {
-                duration_secs = Some(secs.max(1));
-                reason = format!("{}{}", reason[..dpos].trim(), after[num.len()..].trim());
+/// Build a moderator query from the engine-routed command. The engine already
+/// parsed + routed `!ban`/`!timeout`; here we map command_name -> query and
+/// extract the target/reason from the message args (no re-parsing). The actor
+/// (message author) is included.
+fn build_mod_query(command_name: &str, message: &str, author: &str) -> Option<(String, serde_json::Value)> {
+    let mut tokens = message.trim().split_whitespace();
+    let _cmd = tokens.next()?;
+    match command_name {
+        "ban" => {
+            let target = clean_target(tokens.next()?);
+            if target.is_empty() {
+                return None;
             }
+            // Discord bans are permanent — a timed ban (`!ban @user -d 300`) is
+            // a timeout instead (matches how the engine's mod_timeout works).
+            let mut duration_secs: Option<i64> = None;
+            let mut reason = tokens.collect::<Vec<_>>().join(" ");
+            if let Some(dpos) = reason.find("-d") {
+                let after = reason[dpos + 2..].trim();
+                let (num, _) = after.split_once(char::is_whitespace).unwrap_or((after, ""));
+                if let Ok(secs) = num.parse::<i64>() {
+                    duration_secs = Some(secs.max(1));
+                    reason = format!("{}{}", reason[..dpos].trim(), after[num.len()..].trim());
+                }
+            }
+            if let Some(duration_secs) = duration_secs {
+                return Some((
+                    "mod_timeout".to_string(),
+                    serde_json::json!({
+                        "platform": "discord",
+                        "handle": target,
+                        "duration_secs": duration_secs,
+                        "reason": reason,
+                        "actor": { "platform": "discord", "handle": author },
+                    }),
+                ));
+            }
+            return Some((
+                "mod_ban".to_string(),
+                serde_json::json!({
+                    "platform": "discord",
+                    "handle": target,
+                    "reason": reason,
+                    "actor": { "platform": "discord", "handle": author },
+                }),
+            ));
         }
-        if let Some(duration_secs) = duration_secs {
+
+        "timeout" => {
+            let target = clean_target(tokens.next()?);
+            if target.is_empty() {
+                return None;
+            }
+            let mut duration_secs = 300i64;
+            let mut reason = String::new();
+            if let Some(d) = tokens.next() {
+                if let Ok(secs) = d.parse::<i64>() {
+                    duration_secs = secs;
+                } else {
+                    reason = d.to_string();
+                }
+            }
+            let rest: Vec<&str> = tokens.collect();
+            if !rest.is_empty() {
+                if !reason.is_empty() {
+                    reason = format!("{} {}", reason, rest.join(" "));
+                } else {
+                    reason = rest.join(" ");
+                }
+            }
             return Some((
                 "mod_timeout".to_string(),
                 serde_json::json!({
@@ -250,55 +291,9 @@ fn parse_mod_command(message: &str, author: &str) -> Option<(String, serde_json:
                 }),
             ));
         }
-        return Some((
-            "mod_ban".to_string(),
-            serde_json::json!({
-                "platform": "discord",
-                "handle": target,
-                "reason": reason,
-                "actor": { "platform": "discord", "handle": author },
-            }),
-        ));
-    }
 
-    if lower.starts_with("!timeout") {
-        let args = trimmed[9..].trim();
-        let mut parts = args.split_whitespace();
-        let target = parts.next().unwrap_or("").to_string();
-        let target = clean_target(&target);
-        if target.is_empty() {
-            return None;
-        }
-        let mut duration_secs = 300i64;
-        let mut reason = String::new();
-        if let Some(d) = parts.next() {
-            if let Ok(secs) = d.parse::<i64>() {
-                duration_secs = secs;
-            } else {
-                reason = d.to_string();
-            }
-        }
-        let rest: Vec<&str> = parts.collect();
-        if !rest.is_empty() {
-            if !reason.is_empty() {
-                reason = format!("{} {}", reason, rest.join(" "));
-            } else {
-                reason = rest.join(" ");
-            }
-        }
-        return Some((
-            "mod_timeout".to_string(),
-            serde_json::json!({
-                "platform": "discord",
-                "handle": target,
-                "duration_secs": duration_secs,
-                "reason": reason,
-                "actor": { "platform": "discord", "handle": author },
-            }),
-        ));
+        _ => None,
     }
-
-    None
 }
 
 // ── Discord REST helpers ──────────────────────────────────────────────
@@ -1002,7 +997,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .as_ref()
                             .map(|u| u.username.clone())
                             .unwrap_or_default();
-                        if let Some((qid, payload)) = parse_mod_command(&chat.raw_message, &author) {
+                        if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
                             let query = Container {
                                 version: 1,
                                 auth_token: auth_token.clone(),
@@ -1102,7 +1097,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{all_send_channels, parse_servers, ServerChannels, extract_image_urls, parse_mod_command};
+    use super::{all_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query};
     use serde_json::json;
 
     #[test]
@@ -1167,7 +1162,7 @@ mod tests {
     fn ban_with_duration_routes_to_timeout() {
         // Discord bans are permanent — `!ban @user -d 300` must become a
         // mod_timeout so the engine can unban later.
-        let (qid, payload) = parse_mod_command("!ban @user -d 300 spamming", "mod").unwrap();
+        let (qid, payload) = build_mod_query("ban", "!ban @user -d 300 spamming", "mod").unwrap();
         assert_eq!(qid, "mod_timeout");
         assert_eq!(payload["duration_secs"], 300);
         assert_eq!(payload["handle"], "user");
@@ -1175,7 +1170,7 @@ mod tests {
         assert_eq!(payload["actor"]["handle"], "mod");
 
         // Plain ban stays a permanent mod_ban.
-        let (qid, payload) = parse_mod_command("!ban @user being awful", "mod").unwrap();
+        let (qid, payload) = build_mod_query("ban", "!ban @user being awful", "mod").unwrap();
         assert_eq!(qid, "mod_ban");
         assert_eq!(payload["reason"], "being awful");
     }
