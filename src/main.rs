@@ -26,6 +26,60 @@ type WsWriteHalf = futures_util::stream::SplitSink<
     WsMessage,
 >;
 
+/// The module's engine-session identity (auth token + assigned instance + name).
+/// Held in a shared Mutex so a reconnect can swap it in place and every other
+/// task (read loop, Discord platform send path) always uses the CURRENT
+/// session's credentials — a stale token after a reconnect would be rejected
+/// by the engine and the module would look dead.
+#[derive(Clone, Default)]
+struct EngineIdentity {
+    auth: String,
+    instance: String,
+    module: String,
+}
+
+/// Re-register the adapter's chat commands with the engine (called on the
+/// initial connect AND after every reconnect — the engine forgets a session's
+/// commands when the socket drops).
+async fn register_commands(
+    write: &Arc<Mutex<WsWriteHalf>>,
+    identity: &Arc<Mutex<EngineIdentity>>,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let commands = Container {
+        version: 1,
+        auth_token: auth.clone(),
+        module_name: module.clone(),
+        module_instance_uuid7: instance.clone(),
+        payload: Some(Payload::CommandsPayload(Commands {
+            commands: vec![
+                Command {
+                    command_name: "ban".to_string(),
+                    command_flag: "!".to_string(),
+                    command_description: "ban a user".to_string(),
+                    command_flags: vec![],
+                },
+                Command {
+                    command_name: "timeout".to_string(),
+                    command_flag: "!".to_string(),
+                    command_description: "timeout a user".to_string(),
+                    command_flags: vec![],
+                },
+            ],
+            alert_on_unknown_command: false,
+        })),
+    };
+    let mut cbuf = Vec::new();
+    if commands.encode(&mut cbuf).is_ok() {
+        let mut w = write.lock().await;
+        let _ = w.send(WsMessage::Binary(cbuf.into())).await;
+    }
+    info!("registered !ban / !timeout commands");
+}
+
 /// Channel policy for one server.
 #[derive(Debug, Clone)]
 enum ServerChannels {
@@ -316,6 +370,7 @@ async fn send_discord_message(
         .post(format!("{}/channels/{}/messages", REST_API, channel_id))
         .bearer_auth(token)
         .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
         .map_err(|e| format!("send request failed: {}", e))?;
@@ -429,9 +484,7 @@ async fn run_discord_gateway(
     member_cache: Arc<Mutex<HashMap<String, String>>>,
     engine_write: Arc<Mutex<WsWriteHalf>>,
     send_channels: Arc<Mutex<Vec<String>>>,
-    auth_token: &str,
-    module_name: &str,
-    instance_uuid: &str,
+    identity: Arc<Mutex<EngineIdentity>>,
 ) {
     loop {
         let (mut ws, _) = match tokio_tungstenite::connect_async(GATEWAY_URL).await {
@@ -544,9 +597,7 @@ async fn run_discord_gateway(
                                         &servers,
                                         &member_cache,
                                         &engine_write,
-                                        auth_token,
-                                        module_name,
-                                        instance_uuid,
+                                        &identity,
                                     )
                                     .await;
                                 }
@@ -604,9 +655,7 @@ async fn handle_message_create(
     servers: &std::collections::HashMap<String, ServerChannels>,
     member_cache: &Arc<Mutex<HashMap<String, String>>>,
     engine_write: &Arc<Mutex<WsWriteHalf>>,
-    auth_token: &str,
-    module_name: &str,
-    instance_uuid: &str,
+    identity: &Arc<Mutex<EngineIdentity>>,
 ) {
     let is_bot = d.get("author").and_then(|a| a.get("bot")).and_then(|b| b.as_bool()).unwrap_or(false);
     if is_bot {
@@ -664,11 +713,17 @@ async fn handle_message_create(
             user_data: None,
         }),
     };
+    // Use the CURRENT session identity (a reconnect swaps it) so platform
+    // sends never carry a stale token after an engine reconnection.
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
     let container = Container {
         version: 1,
-        auth_token: auth_token.to_string(),
-        module_name: module_name.to_string(),
-        module_instance_uuid7: instance_uuid.to_string(),
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
         payload: Some(Payload::MessagePreProcess(pre)),
     };
     let mut buf = Vec::new();
@@ -1093,48 +1148,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to the engine first so prompts can be surfaced to connected UIs
     // before the adapter is configured.
     let cockatiel = CockatielClient::connect("config.json").await?;
-    let auth_token = cockatiel.auth_token.clone();
-    let instance_uuid = cockatiel.instance_uuid7.clone();
-    let module_name = cockatiel.config.module_name.clone();
-    let (write, read) = cockatiel.stream.split();
 
+    let (write, read) = cockatiel.stream.split();
     let engine_write: Arc<Mutex<WsWriteHalf>> = Arc::new(Mutex::new(write));
+    // Shared session identity: the read loop AND the Discord platform send path
+    // read the CURRENT token/instance here, so a reconnect (which swaps this)
+    // never leaves stale credentials behind.
+    let identity: Arc<Mutex<EngineIdentity>> = Arc::new(Mutex::new(EngineIdentity {
+        auth: cockatiel.auth_token.clone(),
+        instance: cockatiel.instance_uuid7.clone(),
+        module: cockatiel.config.module_name.clone(),
+    }));
 
     // Register the mod commands with the engine command system: the engine now
     // parses `!ban` / `!timeout` and routes them back with the parsed Command.
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let commands = Container {
-            version: 1,
-            auth_token: auth_token.clone(),
-            module_name: module_name.clone(),
-            module_instance_uuid7: instance_uuid.clone(),
-            payload: Some(Payload::CommandsPayload(Commands {
-                commands: vec![
-                    Command {
-                        command_name: "ban".to_string(),
-                        command_flag: "!".to_string(),
-                        command_description: "ban a user".to_string(),
-                        command_flags: vec![],
-                    },
-                    Command {
-                        command_name: "timeout".to_string(),
-                        command_flag: "!".to_string(),
-                        command_description: "timeout a user".to_string(),
-                        command_flags: vec![],
-                    },
-                ],
-                alert_on_unknown_command: false,
-            })),
-        };
-        let mut cbuf = Vec::new();
-        use prost::Message;
-        if commands.encode(&mut cbuf).is_ok() {
-            let mut w = engine_write.lock().await;
-            let _ = w.send(WsMessage::Binary(cbuf.into())).await;
-        }
-        info!("registered !ban / !timeout commands");
-    }
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    register_commands(&engine_write, &identity).await;
+
+    // Initial identity, used by the (one-time) setup phase prompts. Runtime
+    // sends read the CURRENT identity from the shared handle instead.
+    let (auth_token, instance_uuid, module_name) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.instance.clone(), id.module.clone())
+    };
+
     let member_cache: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let http = reqwest::Client::new();
 
@@ -1147,101 +1184,140 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `prompt_for_input` can await the operator's typed answer.
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
 
-    // Read task: engine -> adapter (SendToPlatforms / PromptResponse / AuthVerify).
+    // Read-loop + engine-session supervisor. When the socket drops the module
+    // RECONNECTS (with exponential backoff) instead of going zombie on a dead
+    // socket — the old behavior left the platform loop pushing into a dead WS
+    // forever. On reconnect the shared write handle + identity are swapped in
+    // place and commands re-registered on the fresh session.
     {
         let token_state = send_token.clone();
         let channels_state = send_channels.clone();
         let embed_state = send_embed.clone();
         let http = http.clone();
         let engine_write = engine_write.clone();
-        let auth_token = auth_token.clone();
-        let module_name = module_name.clone();
-        let instance_uuid = instance_uuid.clone();
+        let identity_task = identity.clone();
         tokio::spawn(async move {
             let mut read = read;
-            while let Some(msg) = read.next().await {
-                let Ok(WsMessage::Binary(data)) = msg else { continue };
-                let Ok(container) = Container::decode(data.as_ref()) else { continue };
-                let Some(payload) = container.payload else { continue };
-                match payload {
-                    // Answer the engine's liveness probe with our auth token so
-                    // a quiet period never gets us severed as unresponsive.
-                    Payload::AuthVerify(_) => {
-                        let reply = Container {
-                            version: 1,
-                            auth_token: auth_token.clone(),
-                            module_name: module_name.clone(),
-                            module_instance_uuid7: instance_uuid.clone(),
-                            payload: Some(Payload::AuthVerify(AuthVerify {
-                                cur_auth: auth_token.clone(),
-                            })),
-                        };
-                        let mut buf = Vec::new();
-                        if reply.encode(&mut buf).is_ok() {
-                            let mut w = engine_write.lock().await;
-                            let _ = w.send(WsMessage::Binary(buf.into())).await;
-                        }
-                    }
-                    Payload::SendToPlatforms(send) => {
-                        let token = token_state.lock().await.clone();
-                        let channels = channels_state.lock().await.clone();
-                        let embed = *embed_state.lock().await;
-                        // Target a single channel when the sender specified one
-                        // (e.g. engine !help / invalid-command replies); else
-                        // send to every monitored channel.
-                        let targets: Vec<&String> = if !send.channel_id.is_empty() {
-                            channels.iter().filter(|c| **c == send.channel_id).collect()
-                        } else {
-                            channels.iter().collect()
-                        };
-                        if targets.is_empty() {
-                            warn!("SendToPlatforms received but no matching channel configured.");
-                            continue;
-                        }
-                        for ch in targets {
-                            match send_discord_message(&http, &token, ch, &send.msg, embed).await {
-                                Ok(()) => info!("Sent to Discord channel {}: {}", ch, send.msg),
-                                Err(e) => error!("SendToPlatforms failed on {}: {}", ch, e),
-                            }
-                        }
-                    }
-                    Payload::PromptResponse(resp) => {
-                        // Forward operator answers to the awaiting prompt.
-                        let _ = prompt_tx.send(resp);
-                    }
-                    // Routed chat command: the engine parsed `!ban` / `!timeout`
-                    // and delivered it here with the parsed Command attached.
-                    Payload::MessagePreProcess(pre) => {
-                        let Some(chat) = pre.raw_message else { continue };
-                        let Some(cmd) = chat.command else { continue };
-                        if cmd.command_name != "ban" && cmd.command_name != "timeout" {
-                            continue;
-                        }
-                        let author = chat
-                            .user_data
-                            .as_ref()
-                            .map(|u| u.username.clone())
-                            .unwrap_or_default();
-                        if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
-                            let query = Container {
+            loop {
+                // Read until the connection dies.
+                while let Some(msg) = read.next().await {
+                    let Ok(WsMessage::Binary(data)) = msg else { continue };
+                    let Ok(container) = Container::decode(data.as_ref()) else { continue };
+                    let Some(payload) = container.payload else { continue };
+                    // Use the CURRENT session identity (a reconnect swaps it).
+                    let (auth, instance, module) = {
+                        let id = identity_task.lock().await;
+                        (id.auth.clone(), id.instance.clone(), id.module.clone())
+                    };
+                    match payload {
+                        // Answer the engine's liveness probe with our auth token
+                        // so a quiet period never severs us as unresponsive.
+                        Payload::AuthVerify(_) => {
+                            let reply = Container {
                                 version: 1,
-                                auth_token: auth_token.clone(),
-                                module_name: module_name.clone(),
-                                module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(Payload::DatabaseQuery(DatabaseQuery {
-                                    query_id: qid,
-                                    sql: payload.to_string(),
-                                    params: vec![],
+                                auth_token: auth.clone(),
+                                module_name: module.clone(),
+                                module_instance_uuid7: instance.clone(),
+                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                    cur_auth: auth.clone(),
                                 })),
                             };
-                            let mut qbuf = Vec::new();
-                            if query.encode(&mut qbuf).is_ok() {
+                            let mut buf = Vec::new();
+                            if reply.encode(&mut buf).is_ok() {
                                 let mut w = engine_write.lock().await;
-                                let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                                let _ = w.send(WsMessage::Binary(buf.into())).await;
                             }
                         }
+                        Payload::SendToPlatforms(send) => {
+                            let token = token_state.lock().await.clone();
+                            let channels = channels_state.lock().await.clone();
+                            let embed = *embed_state.lock().await;
+                            // Target a single channel when the sender specified one
+                            // (e.g. engine !help / invalid-command replies); else
+                            // send to every monitored channel.
+                            let targets: Vec<&String> = if !send.channel_id.is_empty() {
+                                channels.iter().filter(|c| **c == send.channel_id).collect()
+                            } else {
+                                channels.iter().collect()
+                            };
+                            if targets.is_empty() {
+                                warn!("SendToPlatforms received but no matching channel configured.");
+                                continue;
+                            }
+                            for ch in targets {
+                                match send_discord_message(&http, &token, ch, &send.msg, embed).await {
+                                    Ok(()) => info!("Sent to Discord channel {}: {}", ch, send.msg),
+                                    Err(e) => error!("SendToPlatforms failed on {}: {}", ch, e),
+                                }
+                            }
+                        }
+                        Payload::PromptResponse(resp) => {
+                            // Forward operator answers to the awaiting prompt.
+                            let _ = prompt_tx.send(resp);
+                        }
+                        // Routed chat command: the engine parsed `!ban` / `!timeout`
+                        // and delivered it here with the parsed Command attached.
+                        Payload::MessagePreProcess(pre) => {
+                            let Some(chat) = pre.raw_message else { continue };
+                            let Some(cmd) = chat.command else { continue };
+                            if cmd.command_name != "ban" && cmd.command_name != "timeout" {
+                                continue;
+                            }
+                            let author = chat
+                                .user_data
+                                .as_ref()
+                                .map(|u| u.username.clone())
+                                .unwrap_or_default();
+                            if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
+                                let query = Container {
+                                    version: 1,
+                                    auth_token: auth.clone(),
+                                    module_name: module.clone(),
+                                    module_instance_uuid7: instance.clone(),
+                                    payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                        query_id: qid,
+                                        sql: payload.to_string(),
+                                        params: vec![],
+                                    })),
+                                };
+                                let mut qbuf = Vec::new();
+                                if query.encode(&mut qbuf).is_ok() {
+                                    let mut w = engine_write.lock().await;
+                                    let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                }
+
+                // The engine connection dropped — reconnect with backoff instead of
+                // leaving the platform loop pushing into a dead socket.
+                info!("Engine disconnected — reconnecting...");
+                let mut backoff = 1u64;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    match CockatielClient::connect("config.json").await {
+                        Ok(conn) => {
+                            info!("Reconnected to engine");
+                            let (w, r) = conn.stream.split();
+                            *engine_write.lock().await = w;
+                            *identity_task.lock().await = EngineIdentity {
+                                auth: conn.auth_token,
+                                instance: conn.instance_uuid7,
+                                module: conn.config.module_name,
+                            };
+                            // The engine forgets a session's commands when the
+                            // socket drops — re-register on the fresh session.
+                            register_commands(&engine_write, &identity_task).await;
+                            read = r;
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
+                            backoff = (backoff * 2).min(30);
+                        }
+                    }
                 }
             }
         });
@@ -1308,9 +1384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         member_cache,
         engine_write,
         send_channels,
-        &auth_token,
-        &module_name,
-        &instance_uuid,
+        identity,
     )
     .await;
 
