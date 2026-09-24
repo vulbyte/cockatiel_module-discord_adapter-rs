@@ -2,7 +2,6 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -36,6 +35,16 @@ struct EngineIdentity {
     auth: String,
     instance: String,
     module: String,
+}
+
+/// A queued Discord platform send. Outbound REST calls are handed to a bounded
+/// worker pool so the engine read loop never blocks on a slow Discord send.
+struct DiscordSendJob {
+    client: reqwest::Client,
+    token: String,
+    channel_id: String,
+    msg: String,
+    embed: bool,
 }
 
 /// Re-register the adapter's chat commands with the engine (called on the
@@ -124,18 +133,40 @@ fn serialize_servers(servers: &std::collections::HashMap<String, ServerChannels>
     serde_json::Value::Object(obj)
 }
 
-/// All explicitly-listed channel IDs across every server (used for
-/// SendToPlatforms; * servers contribute none since we can't enumerate).
-fn all_send_channels(servers: &std::collections::HashMap<String, ServerChannels>) -> Vec<String> {
+/// Union channel IDs across every server, deduped + sorted. `Some` policies
+/// contribute their explicit list; `All` ("*") policies contribute the
+/// caller-resolved text-channel list for that guild (never silently dropped).
+fn merge_send_channels(
+    servers: &std::collections::HashMap<String, ServerChannels>,
+    all_channels: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
     let mut out = Vec::new();
-    for policy in servers.values() {
-        if let ServerChannels::Some(chs) = policy {
-            out.extend(chs.iter().cloned());
+    for (guild, policy) in servers {
+        match policy {
+            ServerChannels::Some(chs) => out.extend(chs.iter().cloned()),
+            ServerChannels::All => out.extend(all_channels.get(guild).into_iter().flatten().cloned()),
         }
     }
     out.sort();
     out.dedup();
     out
+}
+
+/// Resolve the full send-target list for SendToPlatforms. A `*` server is
+/// resolved to the text channels the bot can see in that guild (via REST), so
+/// engine replies are never silently dropped for wildcard-monitored servers.
+async fn resolve_send_channels(
+    client: &reqwest::Client,
+    token: &str,
+    servers: &std::collections::HashMap<String, ServerChannels>,
+) -> Vec<String> {
+    let mut all_channels = std::collections::HashMap::new();
+    for (guild, policy) in servers {
+        if matches!(policy, ServerChannels::All) {
+            all_channels.insert(guild.clone(), guild_text_channels(client, token, guild).await);
+        }
+    }
+    merge_send_channels(servers, &all_channels)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -444,6 +475,35 @@ async fn guild_channels(client: &reqwest::Client, token: &str, guild_id: &str) -
         .unwrap_or_default()
 }
 
+/// Text-capable channel IDs in a server (GUILD_TEXT + GUILD_ANNOUNCEMENT),
+/// used to resolve a `ServerChannels::All` ("*") policy into concrete send
+/// targets. Voice/category/forum channels can't receive plain messages.
+async fn guild_text_channels(client: &reqwest::Client, token: &str, guild_id: &str) -> Vec<String> {
+    let Ok(resp) = client
+        .get(format!("{}/guilds/{}/channels", REST_API, guild_id))
+        .bearer_auth(token)
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|c| {
+                    let ty = c.get("type").and_then(|t| t.as_u64()).unwrap_or(1);
+                    ty == 0 || ty == 5
+                })
+                .filter_map(|c| c.get("id").and_then(|i| i.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The operator's choice when a configured server/channel is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TieChoice {
@@ -477,16 +537,20 @@ fn tie_choices_help() -> String {
 /// MESSAGE_CREATE events to the engine as preprocessed messages. Receive-only:
 /// the token + servers/channels were resolved + validated in the linear setup
 /// phase, so this loop never prompts (no reconnect re-prompt spin).
-#[allow(clippy::too_many_arguments)]
 async fn run_discord_gateway(
+    client: reqwest::Client,
     token: String,
     servers: std::collections::HashMap<String, ServerChannels>,
-    member_cache: Arc<Mutex<HashMap<String, String>>>,
     engine_write: Arc<Mutex<WsWriteHalf>>,
     send_channels: Arc<Mutex<Vec<String>>>,
     identity: Arc<Mutex<EngineIdentity>>,
 ) {
+    // Exponential backoff across repeated auth rejections (4004/4005/op 9):
+    // a fixed 5s retry with the same bad token hammers the gateway and can
+    // trip Discord's 4008 rate limit. Normal drops keep the fixed 5s.
+    let mut auth_backoff = 1u64;
     loop {
+        let mut auth_failed = false;
         let (mut ws, _) = match tokio_tungstenite::connect_async(GATEWAY_URL).await {
             Ok(c) => c,
             Err(e) => {
@@ -551,7 +615,8 @@ async fn run_discord_gateway(
                                 );
                                 let code: u16 = f.code.into();
                                 if code == 4004 || code == 4005 {
-                                    warn!("Discord rejected the bot token (auth failed) — the token was verified in setup; check the Developer Portal.");
+                                    error!("Discord gateway rejected the bot token (close code {}). The token is invalid or the Message Content intent is missing — fix it in the Discord Developer Portal / module .env.", code);
+                                    auth_failed = true;
                                 }
                             } else {
                                 warn!("Discord gateway closed the connection (no close frame)");
@@ -567,9 +632,12 @@ async fn run_discord_gateway(
                     if let Some(s) = payload.get("s").and_then(|s| s.as_u64()) {
                         seq = Some(s);
                     }
-                    // op 9 = Invalid Session (bad token / session expired).
+                    // op 9 = Invalid Session (bad token / session expired). A
+                    // rejected token makes this loop forever if we reconnect on
+                    // a fixed timer, so treat it like an auth failure (backoff).
                     if op == 9 {
-                        warn!("Discord gateway reported an invalid session (op 9) — the bot token may be wrong.");
+                        error!("Discord gateway reported an invalid session (op 9) — the bot token is likely wrong.");
+                        auth_failed = true;
                         break 'conn;
                     }
                     if op == 0 {
@@ -587,19 +655,15 @@ async fn run_discord_gateway(
                                         ServerChannels::Some(chs) => format!("{}={}", g, chs.join(",")),
                                     })
                                     .collect();
-                                let _ = *send_channels.lock().await = all_send_channels(&servers);
+                                // Resolve the full send-target list, expanding
+                                // `*` servers to their text channels so engine
+                                // replies are never silently dropped.
+                                *send_channels.lock().await = resolve_send_channels(&client, &token, &servers).await;
                                 info!("Monitoring servers: {}", desc.join(" · "));
                             }
                             "MESSAGE_CREATE" => {
                                 if let Some(d) = d {
-                                    handle_message_create(
-                                        d,
-                                        &servers,
-                                        &member_cache,
-                                        &engine_write,
-                                        &identity,
-                                    )
-                                    .await;
+                                    handle_message_create(d, &servers, &engine_write, &identity).await;
                                 }
                             }
                             _ => {}
@@ -609,8 +673,18 @@ async fn run_discord_gateway(
             }
         }
 
-        warn!("Discord gateway disconnected. Reconnecting in 5s...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if auth_failed {
+            error!(
+                "Discord gateway auth failed — the bot token is rejected. Backing off {}s before retrying (a fixed retry would hammer the gateway / trip close code 4008).",
+                auth_backoff
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(auth_backoff)).await;
+            auth_backoff = (auth_backoff * 2).min(30);
+        } else {
+            auth_backoff = 1;
+            warn!("Discord gateway disconnected. Reconnecting in 5s...");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
     }
 }
 
@@ -653,7 +727,6 @@ fn extract_image_urls(d: &serde_json::Value) -> Vec<String> {
 async fn handle_message_create(
     d: &serde_json::Value,
     servers: &std::collections::HashMap<String, ServerChannels>,
-    member_cache: &Arc<Mutex<HashMap<String, String>>>,
     engine_write: &Arc<Mutex<WsWriteHalf>>,
     identity: &Arc<Mutex<EngineIdentity>>,
 ) {
@@ -674,7 +747,6 @@ async fn handle_message_create(
         return;
     }
     let author = d.get("author").and_then(|a| a.get("username")).and_then(|u| u.as_str()).unwrap_or("Unknown");
-    let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|u| u.as_str()).unwrap_or("");
     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
 
     // Uploaded images arrive as attachments / embeds, not in `content`. Collect
@@ -692,11 +764,6 @@ async fn handle_message_create(
             raw_message.push(' ');
         }
         raw_message.push_str(url);
-    }
-
-    // Cache the author id -> username so `<@id>` mention targets can resolve.
-    if !author_id.is_empty() {
-        member_cache.lock().await.insert(author_id.to_string(), author.to_string());
     }
 
     let pre = MessagePreProcess {
@@ -829,7 +896,7 @@ async fn resolve_auth(
             warn!("Discord rejected the stored bot token — prompting for a fresh one.");
             bot_token.clear();
         }
-        if let Some(val) = prompt_for_input(
+        match prompt_for_input(
             engine_write,
             prompt_rx,
             auth_token,
@@ -843,14 +910,23 @@ async fn resolve_auth(
         )
         .await
         {
-            let t = val.trim().to_string();
-            if !t.is_empty() {
+            Some(val) => {
+                let t = val.trim().to_string();
+                if t.is_empty() {
+                    // Empty input is a cancel — exit so the supervisor can
+                    // restart the module instead of pinning setup forever.
+                    error!("Discord bot token setup cancelled (no token provided). Exiting so the supervisor can restart the module.");
+                    std::process::exit(1);
+                }
                 bot_token = t;
                 cockatiel_client::write_env_file(".env", &[("DISCORD_BOT_TOKEN", &bot_token)]);
             }
+            None => {
+                // Operator cancelled / prompt timed out — same clean exit.
+                error!("Discord bot token setup cancelled by the operator. Exiting so the supervisor can restart the module.");
+                std::process::exit(1);
+            }
         }
-        // Cancelled / empty — pause so a silent operator doesn't make us spin.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
@@ -1172,7 +1248,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (id.auth.clone(), id.instance.clone(), id.module.clone())
     };
 
-    let member_cache: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let http = reqwest::Client::new();
 
     // Send state for the read task, populated once config resolves.
@@ -1198,6 +1273,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let identity_task = identity.clone();
         tokio::spawn(async move {
             let mut read = read;
+            // Bounded outbound send queue: Discord platform sends are offloaded
+            // here so the read loop returns immediately (a stalled REST call must
+            // never delay an AuthVerify reply — the engine would sever us as dead
+            // past its liveness probe). A fixed worker pool + bounded channel also
+            // means a reply flood can't spawn unbounded tasks or pile up memory.
+            let (send_tx, send_rx) = mpsc::channel::<DiscordSendJob>(64);
+            let send_rx = Arc::new(Mutex::new(send_rx));
+            for _ in 0..4 {
+                let rx = send_rx.clone();
+                tokio::spawn(async move {
+                    while let Some(job) = { let mut guard = rx.lock().await; guard.recv().await } {
+                        match send_discord_message(&job.client, &job.token, &job.channel_id, &job.msg, job.embed).await {
+                            Ok(()) => info!("Sent to Discord channel {}: {}", job.channel_id, job.msg),
+                            Err(e) => error!("SendToPlatforms failed on {}: {}", job.channel_id, e),
+                        }
+                    }
+                });
+            }
             loop {
                 // Read until the connection dies.
                 while let Some(msg) = read.next().await {
@@ -1235,19 +1328,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Target a single channel when the sender specified one
                             // (e.g. engine !help / invalid-command replies); else
                             // send to every monitored channel.
-                            let targets: Vec<&String> = if !send.channel_id.is_empty() {
-                                channels.iter().filter(|c| **c == send.channel_id).collect()
+                            let targets: Vec<String> = if !send.channel_id.is_empty() {
+                                channels.iter().filter(|c| **c == send.channel_id).cloned().collect()
                             } else {
-                                channels.iter().collect()
+                                channels.clone()
                             };
                             if targets.is_empty() {
                                 warn!("SendToPlatforms received but no matching channel configured.");
                                 continue;
                             }
+                            // Offload every send to the worker pool so the read
+                            // loop returns immediately (AuthVerify stays responsive).
                             for ch in targets {
-                                match send_discord_message(&http, &token, ch, &send.msg, embed).await {
-                                    Ok(()) => info!("Sent to Discord channel {}: {}", ch, send.msg),
-                                    Err(e) => error!("SendToPlatforms failed on {}: {}", ch, e),
+                                let job = DiscordSendJob {
+                                    client: http.clone(),
+                                    token: token.clone(),
+                                    channel_id: ch.clone(),
+                                    msg: send.msg.clone(),
+                                    embed,
+                                };
+                                if send_tx.try_send(job).is_err() {
+                                    warn!("SendToPlatforms queue full — dropping reply to channel {}", ch);
                                 }
                             }
                         }
@@ -1258,8 +1359,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Routed chat command: the engine parsed `!ban` / `!timeout`
                         // and delivered it here with the parsed Command attached.
                         Payload::MessagePreProcess(pre) => {
+                            let uuid = pre.message_uuid7.clone();
                             let Some(chat) = pre.raw_message else { continue };
-                            let Some(cmd) = chat.command else { continue };
+                            let Some(cmd) = chat.command.as_ref() else { continue };
                             if cmd.command_name != "ban" && cmd.command_name != "timeout" {
                                 continue;
                             }
@@ -1285,6 +1387,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let mut w = engine_write.lock().await;
                                     let _ = w.send(WsMessage::Binary(qbuf.into())).await;
                                 }
+                            }
+                            // ACK the pre_process stage: echo the raw ChatMessage
+                            // back with the SAME message_uuid7 so the engine marks
+                            // this message pre-processed. Without this the command
+                            // message strands in the pipeline until the engine's
+                            // timeout sweep.
+                            let ack = Container {
+                                version: 1,
+                                auth_token: auth.clone(),
+                                module_name: module.clone(),
+                                module_instance_uuid7: instance.clone(),
+                                payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+                                    audio: vec![],
+                                    audio_type: String::new(),
+                                    message_uuid7: uuid,
+                                    raw_message: Some(chat.clone()),
+                                })),
+                            };
+                            let mut abuf = Vec::new();
+                            if ack.encode(&mut abuf).is_ok() {
+                                let mut w = engine_write.lock().await;
+                                let _ = w.send(WsMessage::Binary(abuf)).await;
                             }
                         }
                         _ => {}
@@ -1370,18 +1494,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Publish the resolved token/channels to the read task.
+    // Publish the resolved token/channels to the read task. `*` servers are
+    // expanded to their text channels so engine replies are never dropped.
     *send_token.lock().await = bot_token.clone();
-    *send_channels.lock().await = all_send_channels(&servers);
+    *send_channels.lock().await = resolve_send_channels(&http, &bot_token, &servers).await;
     let embed_sends = load_adapter_config().map(|c| c.embed_sends).unwrap_or(false);
     *send_embed.lock().await = embed_sends;
 
     // Discord gateway task — receive-only (all setup/validation happened above).
     info!("Connecting to Discord gateway...");
     run_discord_gateway(
+        http,
         bot_token,
         servers,
-        member_cache,
         engine_write,
         send_channels,
         identity,
@@ -1392,7 +1517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{all_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice};
+    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice};
     use serde_json::json;
 
     #[test]
@@ -1423,16 +1548,38 @@ mod tests {
     }
 
     #[test]
-    fn all_send_channels_union_and_skips_all() {
+    fn merge_send_channels_unions_and_resolves_all() {
         let input: std::collections::HashMap<String, Vec<String>> = serde_json::from_value(json!({
             "g1": ["ch1", "ch2"],
             "g2": ["*"],
             "g3": ["ch3"],
         })).unwrap();
         let servers = parse_servers(&input);
-        let mut send = all_send_channels(&servers);
-        send.sort();
-        assert_eq!(send, vec!["ch1".to_string(), "ch2".to_string(), "ch3".to_string()]);
+        // "*" (ServerChannels::All) is resolved to the guild's text channels
+        // instead of being silently dropped.
+        let mut all = std::collections::HashMap::new();
+        all.insert("g2".to_string(), vec!["ga".to_string(), "gb".to_string()]);
+        let send = merge_send_channels(&servers, &all);
+        assert_eq!(
+            send,
+            vec![
+                "ch1".to_string(),
+                "ch2".to_string(),
+                "ch3".to_string(),
+                "ga".to_string(),
+                "gb".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_send_channels_dedups_and_handles_missing_all() {
+        let input: std::collections::HashMap<String, Vec<String>> = serde_json::from_value(json!({
+            "g1": ["ch1", "ch1", "ch2"],
+        })).unwrap();
+        let servers = parse_servers(&input);
+        let send = merge_send_channels(&servers, &std::collections::HashMap::new());
+        assert_eq!(send, vec!["ch1".to_string(), "ch2".to_string()]);
     }
 
     #[test]
