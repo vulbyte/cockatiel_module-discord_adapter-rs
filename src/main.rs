@@ -45,6 +45,7 @@ struct DiscordSendJob {
     channel_id: String,
     msg: String,
     embed: bool,
+    http_timeout_secs: u64,
 }
 
 /// Re-register the adapter's chat commands with the engine (called on the
@@ -169,13 +170,185 @@ async fn resolve_send_channels(
     merge_send_channels(servers, &all_channels)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct DiscordAdapterConfig {
     bot_token: Option<String>,
     #[serde(default)]
     servers: std::collections::HashMap<String, Vec<String>>,
     #[serde(default)]
     embed_sends: bool,
+    // Runtime tuning knobs. Each `#[serde(default = ...)]` supplies the
+    // previous hardcoded constant when the key is missing from config.json,
+    // so an absent setting behaves exactly as before.
+    #[serde(default = "DiscordAdapterConfig::default_timeout_secs")]
+    default_timeout_secs: i64,
+    #[serde(default = "DiscordAdapterConfig::http_timeout_secs")]
+    http_timeout_secs: u64,
+    #[serde(default = "DiscordAdapterConfig::gateway_auth_backoff_base_secs")]
+    gateway_auth_backoff_base_secs: u64,
+    #[serde(default = "DiscordAdapterConfig::gateway_auth_backoff_max_secs")]
+    gateway_auth_backoff_max_secs: u64,
+    #[serde(default = "DiscordAdapterConfig::gateway_connect_retry_secs")]
+    gateway_connect_retry_secs: u64,
+    #[serde(default = "DiscordAdapterConfig::gateway_reconnect_delay_secs")]
+    gateway_reconnect_delay_secs: u64,
+    #[serde(default = "DiscordAdapterConfig::outbound_queue_cap")]
+    outbound_queue_cap: usize,
+    #[serde(default = "DiscordAdapterConfig::send_worker_count")]
+    send_worker_count: usize,
+    #[serde(default = "DiscordAdapterConfig::reconnect_base_secs")]
+    reconnect_base_secs: u64,
+    #[serde(default = "DiscordAdapterConfig::reconnect_max_secs")]
+    reconnect_max_secs: u64,
+    #[serde(default = "DiscordAdapterConfig::prompt_timeout_secs")]
+    prompt_timeout_secs: u32,
+}
+
+impl DiscordAdapterConfig {
+    fn default_timeout_secs() -> i64 {
+        300
+    }
+    fn http_timeout_secs() -> u64 {
+        15
+    }
+    fn gateway_auth_backoff_base_secs() -> u64 {
+        1
+    }
+    fn gateway_auth_backoff_max_secs() -> u64 {
+        30
+    }
+    fn gateway_connect_retry_secs() -> u64 {
+        5
+    }
+    fn gateway_reconnect_delay_secs() -> u64 {
+        5
+    }
+    fn outbound_queue_cap() -> usize {
+        64
+    }
+    fn send_worker_count() -> usize {
+        4
+    }
+    fn reconnect_base_secs() -> u64 {
+        1
+    }
+    fn reconnect_max_secs() -> u64 {
+        30
+    }
+    fn prompt_timeout_secs() -> u32 {
+        300
+    }
+}
+
+impl Default for DiscordAdapterConfig {
+    fn default() -> Self {
+        Self {
+            bot_token: None,
+            servers: Default::default(),
+            embed_sends: false,
+            default_timeout_secs: Self::default_timeout_secs(),
+            http_timeout_secs: Self::http_timeout_secs(),
+            gateway_auth_backoff_base_secs: Self::gateway_auth_backoff_base_secs(),
+            gateway_auth_backoff_max_secs: Self::gateway_auth_backoff_max_secs(),
+            gateway_connect_retry_secs: Self::gateway_connect_retry_secs(),
+            gateway_reconnect_delay_secs: Self::gateway_reconnect_delay_secs(),
+            outbound_queue_cap: Self::outbound_queue_cap(),
+            send_worker_count: Self::send_worker_count(),
+            reconnect_base_secs: Self::reconnect_base_secs(),
+            reconnect_max_secs: Self::reconnect_max_secs(),
+            prompt_timeout_secs: Self::prompt_timeout_secs(),
+        }
+    }
+}
+
+/// Runtime tuning knobs read from `config.json` (`module_specific`). A small
+/// snapshot keeps the values easy to thread into the functions that previously
+/// held the hardcoded literals.
+#[derive(Debug, Clone)]
+struct Tuning {
+    default_timeout_secs: i64,
+    http_timeout_secs: u64,
+    gateway_auth_backoff_base_secs: u64,
+    gateway_auth_backoff_max_secs: u64,
+    gateway_connect_retry_secs: u64,
+    gateway_reconnect_delay_secs: u64,
+    outbound_queue_cap: usize,
+    send_worker_count: usize,
+    reconnect_base_secs: u64,
+    reconnect_max_secs: u64,
+    prompt_timeout_secs: u32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            default_timeout_secs: DiscordAdapterConfig::default_timeout_secs(),
+            http_timeout_secs: DiscordAdapterConfig::http_timeout_secs(),
+            gateway_auth_backoff_base_secs: DiscordAdapterConfig::gateway_auth_backoff_base_secs(),
+            gateway_auth_backoff_max_secs: DiscordAdapterConfig::gateway_auth_backoff_max_secs(),
+            gateway_connect_retry_secs: DiscordAdapterConfig::gateway_connect_retry_secs(),
+            gateway_reconnect_delay_secs: DiscordAdapterConfig::gateway_reconnect_delay_secs(),
+            outbound_queue_cap: DiscordAdapterConfig::outbound_queue_cap(),
+            send_worker_count: DiscordAdapterConfig::send_worker_count(),
+            reconnect_base_secs: DiscordAdapterConfig::reconnect_base_secs(),
+            reconnect_max_secs: DiscordAdapterConfig::reconnect_max_secs(),
+            prompt_timeout_secs: DiscordAdapterConfig::prompt_timeout_secs(),
+        }
+    }
+}
+
+impl From<&DiscordAdapterConfig> for Tuning {
+    fn from(cfg: &DiscordAdapterConfig) -> Self {
+        Self {
+            default_timeout_secs: cfg.default_timeout_secs,
+            http_timeout_secs: cfg.http_timeout_secs,
+            gateway_auth_backoff_base_secs: cfg.gateway_auth_backoff_base_secs,
+            gateway_auth_backoff_max_secs: cfg.gateway_auth_backoff_max_secs,
+            gateway_connect_retry_secs: cfg.gateway_connect_retry_secs,
+            gateway_reconnect_delay_secs: cfg.gateway_reconnect_delay_secs,
+            outbound_queue_cap: cfg.outbound_queue_cap,
+            send_worker_count: cfg.send_worker_count,
+            reconnect_base_secs: cfg.reconnect_base_secs,
+            reconnect_max_secs: cfg.reconnect_max_secs,
+            prompt_timeout_secs: cfg.prompt_timeout_secs,
+        }
+    }
+}
+
+/// Ensure every tuning key exists under `module_specific`, writing its default
+/// when missing (mirrors the existing `embed_sends` backfill pattern).
+fn backfill_tuning_defaults() {
+    let path = PathBuf::from("config.json");
+    let Ok(data) = std::fs::read_to_string(&path) else { return };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&data) else { return };
+    let Some(obj) = root.as_object_mut() else { return };
+    let ms = obj
+        .entry("module_specific".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(ms) = ms.as_object_mut() else { return };
+    let pairs: [(&str, serde_json::Value); 11] = [
+        ("default_timeout_secs", serde_json::json!(DiscordAdapterConfig::default_timeout_secs())),
+        ("http_timeout_secs", serde_json::json!(DiscordAdapterConfig::http_timeout_secs())),
+        ("gateway_auth_backoff_base_secs", serde_json::json!(DiscordAdapterConfig::gateway_auth_backoff_base_secs())),
+        ("gateway_auth_backoff_max_secs", serde_json::json!(DiscordAdapterConfig::gateway_auth_backoff_max_secs())),
+        ("gateway_connect_retry_secs", serde_json::json!(DiscordAdapterConfig::gateway_connect_retry_secs())),
+        ("gateway_reconnect_delay_secs", serde_json::json!(DiscordAdapterConfig::gateway_reconnect_delay_secs())),
+        ("outbound_queue_cap", serde_json::json!(DiscordAdapterConfig::outbound_queue_cap())),
+        ("send_worker_count", serde_json::json!(DiscordAdapterConfig::send_worker_count())),
+        ("reconnect_base_secs", serde_json::json!(DiscordAdapterConfig::reconnect_base_secs())),
+        ("reconnect_max_secs", serde_json::json!(DiscordAdapterConfig::reconnect_max_secs())),
+        ("prompt_timeout_secs", serde_json::json!(DiscordAdapterConfig::prompt_timeout_secs())),
+    ];
+    let mut changed = false;
+    for (key, default) in pairs {
+        if !ms.contains_key(key) {
+            ms.insert(key.to_string(), default);
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap_or_default());
+    }
 }
 
 fn load_adapter_config() -> Option<DiscordAdapterConfig> {
@@ -236,8 +409,28 @@ fn load_adapter_config() -> Option<DiscordAdapterConfig> {
         false
     });
 
-    Some(DiscordAdapterConfig { bot_token: Some(bot_token), servers, embed_sends })
-        .filter(|c| !c.bot_token.as_deref().unwrap_or("").is_empty())
+    // Ensure the tuning knobs exist in config.json (created with their defaults
+    // when missing), then read them (serde defaults for any still-absent key).
+    backfill_tuning_defaults();
+    let parsed: DiscordAdapterConfig = serde_json::from_value(saved.clone()).unwrap_or_default();
+
+    Some(DiscordAdapterConfig {
+        bot_token: Some(bot_token),
+        servers,
+        embed_sends,
+        default_timeout_secs: parsed.default_timeout_secs,
+        http_timeout_secs: parsed.http_timeout_secs,
+        gateway_auth_backoff_base_secs: parsed.gateway_auth_backoff_base_secs,
+        gateway_auth_backoff_max_secs: parsed.gateway_auth_backoff_max_secs,
+        gateway_connect_retry_secs: parsed.gateway_connect_retry_secs,
+        gateway_reconnect_delay_secs: parsed.gateway_reconnect_delay_secs,
+        outbound_queue_cap: parsed.outbound_queue_cap,
+        send_worker_count: parsed.send_worker_count,
+        reconnect_base_secs: parsed.reconnect_base_secs,
+        reconnect_max_secs: parsed.reconnect_max_secs,
+        prompt_timeout_secs: parsed.prompt_timeout_secs,
+    })
+    .filter(|c| !c.bot_token.as_deref().unwrap_or("").is_empty())
 }
 
 fn save_adapter_config(
@@ -252,7 +445,16 @@ fn save_adapter_config(
     } else {
         json!({})
     };
-    json_val["module_specific"] = json!({ "servers": serialize_servers(servers) });
+    // Preserve any existing `module_specific` keys (tuning knobs, embed_sends)
+    // so a save never drops them — only `servers` is (re)written.
+    let mut spec = json_val
+        .get("module_specific")
+        .cloned()
+        .and_then(|v| v.as_object().cloned())
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| json!({}));
+    spec["servers"] = serialize_servers(servers);
+    json_val["module_specific"] = spec;
     if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
         let _ = std::fs::write(&path, pretty);
     }
@@ -299,7 +501,12 @@ fn clean_target(raw: &str) -> String {
 /// parsed + routed `!ban`/`!timeout`; here we map command_name -> query and
 /// extract the target/reason from the message args (no re-parsing). The actor
 /// (message author) is included.
-fn build_mod_query(command_name: &str, message: &str, author: &str) -> Option<(String, serde_json::Value)> {
+fn build_mod_query(
+    command_name: &str,
+    message: &str,
+    author: &str,
+    default_timeout_secs: i64,
+) -> Option<(String, serde_json::Value)> {
     let mut tokens = message.trim().split_whitespace();
     let _cmd = tokens.next()?;
     match command_name {
@@ -348,7 +555,7 @@ fn build_mod_query(command_name: &str, message: &str, author: &str) -> Option<(S
             if target.is_empty() {
                 return None;
             }
-            let mut duration_secs = 300i64;
+            let mut duration_secs = default_timeout_secs;
             let mut reason = String::new();
             if let Some(d) = tokens.next() {
                 if let Ok(secs) = d.parse::<i64>() {
@@ -389,6 +596,7 @@ async fn send_discord_message(
     channel_id: &str,
     msg: &str,
     embed: bool,
+    timeout_secs: u64,
 ) -> Result<(), String> {
     // `embed_sends: true` posts a discordjs-style embed instead of a plain
     // message (ROADMAP: "receive a Send and post as an embed").
@@ -401,7 +609,7 @@ async fn send_discord_message(
         .post(format!("{}/channels/{}/messages", REST_API, channel_id))
         .bearer_auth(token)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
         .map_err(|e| format!("send request failed: {}", e))?;
@@ -544,21 +752,25 @@ async fn run_discord_gateway(
     engine_write: Arc<Mutex<WsWriteHalf>>,
     send_channels: Arc<Mutex<Vec<String>>>,
     identity: Arc<Mutex<EngineIdentity>>,
+    tuning: &Tuning,
 ) {
     // Exponential backoff across repeated auth rejections (4004/4005/op 9):
-    // a fixed 5s retry with the same bad token hammers the gateway and can
-    // trip Discord's 4008 rate limit. Normal drops keep the fixed 5s.
-    let mut auth_backoff = 1u64;
+    // a fixed retry with the same bad token hammers the gateway and can
+    // trip Discord's 4008 rate limit. Normal drops keep the fixed delay.
+    let mut auth_backoff = tuning.gateway_auth_backoff_base_secs;
     loop {
         let mut auth_failed = false;
         let (mut ws, _) = match tokio_tungstenite::connect_async(GATEWAY_URL).await {
             Ok(c) => c,
             Err(e) => {
                 error!(
-                    "Failed to connect to Discord gateway ({}). Likely causes: invalid bot token, the Message Content intent is not enabled in the Developer Portal, or the bot is not in the guild. Retrying in 5s...",
-                    e
+                    "Failed to connect to Discord gateway ({}). Likely causes: invalid bot token, the Message Content intent is not enabled in the Developer Portal, or the bot is not in the guild. Retrying in {}s...",
+                    e, tuning.gateway_connect_retry_secs
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    tuning.gateway_connect_retry_secs,
+                ))
+                .await;
                 continue;
             }
         };
@@ -679,11 +891,17 @@ async fn run_discord_gateway(
                 auth_backoff
             );
             tokio::time::sleep(std::time::Duration::from_secs(auth_backoff)).await;
-            auth_backoff = (auth_backoff * 2).min(30);
+            auth_backoff = (auth_backoff * 2).min(tuning.gateway_auth_backoff_max_secs);
         } else {
-            auth_backoff = 1;
-            warn!("Discord gateway disconnected. Reconnecting in 5s...");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            auth_backoff = tuning.gateway_auth_backoff_base_secs;
+            warn!(
+                "Discord gateway disconnected. Reconnecting in {}s...",
+                tuning.gateway_reconnect_delay_secs
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(
+                tuning.gateway_reconnect_delay_secs,
+            ))
+            .await;
         }
     }
 }
@@ -939,6 +1157,7 @@ async fn prompt_tie_choice(
     module_name: &str,
     instance_uuid: &str,
     subject: &str,
+    prompt_timeout_secs: u32,
 ) -> Option<TieChoice> {
     loop {
         let answer = prompt_for_input(
@@ -951,7 +1170,7 @@ async fn prompt_tie_choice(
             &format!("{}\n\n{}", subject, tie_choices_help()),
             "t / i / r / e",
             PromptKind::String,
-            300,
+            prompt_timeout_secs,
         )
         .await;
         match answer.as_deref().and_then(parse_tie_choice) {
@@ -966,6 +1185,7 @@ async fn prompt_tie_choice(
 
 /// No servers configured (or all were invalid): pick one from the bot's guilds
 /// + choose its channels (empty = all).
+#[allow(clippy::too_many_arguments)]
 async fn pick_server_and_channels(
     client: &reqwest::Client,
     token: &str,
@@ -974,6 +1194,7 @@ async fn pick_server_and_channels(
     auth_token: &str,
     module_name: &str,
     instance_uuid: &str,
+    prompt_timeout_secs: u32,
 ) -> Option<(String, ServerChannels)> {
     let bot_guilds = list_bot_guilds(client, token).await;
     if bot_guilds.is_empty() {
@@ -999,7 +1220,7 @@ async fn pick_server_and_channels(
             ),
             "Server number or Guild ID",
             PromptKind::String,
-            300,
+            prompt_timeout_secs,
         )
         .await?;
         let trimmed = answer.trim().to_string();
@@ -1027,7 +1248,7 @@ async fn pick_server_and_channels(
          Leave empty to monitor ALL channels in the selected server.",
         "Channel IDs (comma-separated, empty = all)",
         PromptKind::String,
-        300,
+        prompt_timeout_secs,
     )
     .await;
     let policy = match channels.as_deref().map(str::trim) {
@@ -1055,6 +1276,7 @@ async fn resolve_servers(
     auth_token: &str,
     module_name: &str,
     instance_uuid: &str,
+    prompt_timeout_secs: u32,
     mut servers: std::collections::HashMap<String, ServerChannels>,
 ) -> (std::collections::HashMap<String, ServerChannels>, String) {
     let bot_guilds = list_bot_guilds(client, token).await;
@@ -1062,7 +1284,14 @@ async fn resolve_servers(
 
     if servers.is_empty() {
         if let Some((guild, policy)) = pick_server_and_channels(
-            client, token, engine_write, prompt_rx, auth_token, module_name, instance_uuid,
+            client,
+            token,
+            engine_write,
+            prompt_rx,
+            auth_token,
+            module_name,
+            instance_uuid,
+            prompt_timeout_secs,
         )
         .await
         {
@@ -1077,7 +1306,7 @@ async fn resolve_servers(
             if !bot_guilds.contains(guild) {
                 // The bot isn't in this server — ask the operator.
                 let subject = format!("Server {} is NOT in the bot's accessible servers.", guild);
-                let choice = prompt_tie_choice(engine_write, prompt_rx, auth_token, module_name, instance_uuid, &subject).await;
+                let choice = prompt_tie_choice(engine_write, prompt_rx, auth_token, module_name, instance_uuid, &subject, prompt_timeout_secs).await;
                 match choice {
                     Some(TieChoice::Retry) => {
                         if list_bot_guilds(client, token).await.contains(guild) {
@@ -1099,7 +1328,7 @@ async fn resolve_servers(
                             engine_write, prompt_rx, auth_token, module_name, instance_uuid,
                             "Edit Server ID",
                             "Paste the correct Server (Guild) ID.",
-                            "Server ID", PromptKind::String, 300,
+                            "Server ID", PromptKind::String, prompt_timeout_secs,
                         )
                         .await
                         {
@@ -1135,7 +1364,7 @@ async fn resolve_servers(
                             }
                             // Invalid channel — ask the operator (t/i/r/e).
                             let subject = format!("Channel {} in server {} is NOT a valid channel.", c, guild);
-                            let choice = prompt_tie_choice(engine_write, prompt_rx, auth_token, module_name, instance_uuid, &subject).await;
+                            let choice = prompt_tie_choice(engine_write, prompt_rx, auth_token, module_name, instance_uuid, &subject, prompt_timeout_secs).await;
                             match choice {
                                 Some(TieChoice::Retry) => {
                                     if guild_channels(client, token, guild).await.contains(c) {
@@ -1157,7 +1386,7 @@ async fn resolve_servers(
                                         engine_write, prompt_rx, auth_token, module_name, instance_uuid,
                                         "Edit Channel ID",
                                         "Paste the correct channel ID.",
-                                        "Channel ID", PromptKind::String, 300,
+                                        "Channel ID", PromptKind::String, prompt_timeout_secs,
                                     )
                                     .await
                                     {
@@ -1212,14 +1441,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cockatiel_client::load_env_file(".env");
     let mut bot_token = std::env::var("DISCORD_BOT_TOKEN").unwrap_or_default();
     let mut servers: std::collections::HashMap<String, ServerChannels> = Default::default();
-    if let Some(saved) = load_adapter_config() {
-        if let Some(t) = saved.bot_token {
+    let tuning = if let Some(saved) = load_adapter_config() {
+        if let Some(ref t) = saved.bot_token {
             if !t.is_empty() {
-                bot_token = t;
+                bot_token = t.clone();
             }
         }
         servers = parse_servers(&saved.servers);
-    }
+        Tuning::from(&saved)
+    } else {
+        // No saved config (no bot token) — the tuning knobs still fall back
+        // to their hardcoded defaults.
+        Tuning::default()
+    };
 
     // Connect to the engine first so prompts can be surfaced to connected UIs
     // before the adapter is configured.
@@ -1271,6 +1505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let http = http.clone();
         let engine_write = engine_write.clone();
         let identity_task = identity.clone();
+        let tuning_task = tuning.clone();
         tokio::spawn(async move {
             let mut read = read;
             // Bounded outbound send queue: Discord platform sends are offloaded
@@ -1278,13 +1513,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // never delay an AuthVerify reply — the engine would sever us as dead
             // past its liveness probe). A fixed worker pool + bounded channel also
             // means a reply flood can't spawn unbounded tasks or pile up memory.
-            let (send_tx, send_rx) = mpsc::channel::<DiscordSendJob>(64);
+            let (send_tx, send_rx) = mpsc::channel::<DiscordSendJob>(tuning_task.outbound_queue_cap);
             let send_rx = Arc::new(Mutex::new(send_rx));
-            for _ in 0..4 {
+            for _ in 0..tuning_task.send_worker_count {
                 let rx = send_rx.clone();
                 tokio::spawn(async move {
                     while let Some(job) = { let mut guard = rx.lock().await; guard.recv().await } {
-                        match send_discord_message(&job.client, &job.token, &job.channel_id, &job.msg, job.embed).await {
+                        match send_discord_message(&job.client, &job.token, &job.channel_id, &job.msg, job.embed, job.http_timeout_secs).await {
                             Ok(()) => info!("Sent to Discord channel {}: {}", job.channel_id, job.msg),
                             Err(e) => error!("SendToPlatforms failed on {}: {}", job.channel_id, e),
                         }
@@ -1346,6 +1581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     channel_id: ch.clone(),
                                     msg: send.msg.clone(),
                                     embed,
+                                    http_timeout_secs: tuning_task.http_timeout_secs,
                                 };
                                 if send_tx.try_send(job).is_err() {
                                     warn!("SendToPlatforms queue full — dropping reply to channel {}", ch);
@@ -1370,7 +1606,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .as_ref()
                                 .map(|u| u.username.clone())
                                 .unwrap_or_default();
-                            if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
+                            if let Some((qid, payload)) = build_mod_query(
+                                &cmd.command_name,
+                                &chat.raw_message,
+                                &author,
+                                tuning_task.default_timeout_secs,
+                            ) {
                                 let query = Container {
                                     version: 1,
                                     auth_token: auth.clone(),
@@ -1418,7 +1659,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The engine connection dropped — reconnect with backoff instead of
                 // leaving the platform loop pushing into a dead socket.
                 info!("Engine disconnected — reconnecting...");
-                let mut backoff = 1u64;
+                let mut backoff = tuning_task.reconnect_base_secs;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
                     match CockatielClient::connect("config.json").await {
@@ -1439,7 +1680,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => {
                             error!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
-                            backoff = (backoff * 2).min(30);
+                            backoff = (backoff * 2).min(tuning_task.reconnect_max_secs);
                         }
                     }
                 }
@@ -1471,6 +1712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &auth_token,
         &module_name,
         &instance_uuid,
+        tuning.prompt_timeout_secs,
         servers,
     )
     .await;
@@ -1510,6 +1752,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_write,
         send_channels,
         identity,
+        &tuning,
     )
     .await;
 
@@ -1517,7 +1760,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice};
+    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig};
     use serde_json::json;
 
     #[test]
@@ -1616,7 +1859,7 @@ mod tests {
     fn ban_with_duration_routes_to_timeout() {
         // Discord bans are permanent — `!ban @user -d 300` must become a
         // mod_timeout so the engine can unban later.
-        let (qid, payload) = build_mod_query("ban", "!ban @user -d 300 spamming", "mod").unwrap();
+        let (qid, payload) = build_mod_query("ban", "!ban @user -d 300 spamming", "mod", 300).unwrap();
         assert_eq!(qid, "mod_timeout");
         assert_eq!(payload["duration_secs"], 300);
         assert_eq!(payload["handle"], "user");
@@ -1624,8 +1867,38 @@ mod tests {
         assert_eq!(payload["actor"]["handle"], "mod");
 
         // Plain ban stays a permanent mod_ban.
-        let (qid, payload) = build_mod_query("ban", "!ban @user being awful", "mod").unwrap();
+        let (qid, payload) = build_mod_query("ban", "!ban @user being awful", "mod", 300).unwrap();
         assert_eq!(qid, "mod_ban");
         assert_eq!(payload["reason"], "being awful");
+
+        // !timeout with no explicit duration uses the configured default.
+        let (qid, payload) = build_mod_query("timeout", "!timeout @user spam", "mod", 300).unwrap();
+        assert_eq!(qid, "mod_timeout");
+        assert_eq!(payload["duration_secs"], 300);
+    }
+
+    #[test]
+    fn config_tuning_defaults() {
+        // A module_specific section WITHOUT tuning keys must fall back to the
+        // hardcoded defaults for every knob.
+        let cfg: DiscordAdapterConfig =
+            serde_json::from_value(json!({ "servers": {} })).unwrap();
+        assert_eq!(cfg.default_timeout_secs, 300);
+        assert_eq!(cfg.http_timeout_secs, 15);
+        assert_eq!(cfg.gateway_auth_backoff_base_secs, 1);
+        assert_eq!(cfg.gateway_auth_backoff_max_secs, 30);
+        assert_eq!(cfg.gateway_connect_retry_secs, 5);
+        assert_eq!(cfg.gateway_reconnect_delay_secs, 5);
+        assert_eq!(cfg.outbound_queue_cap, 64);
+        assert_eq!(cfg.send_worker_count, 4);
+        assert_eq!(cfg.reconnect_base_secs, 1);
+        assert_eq!(cfg.reconnect_max_secs, 30);
+        assert_eq!(cfg.prompt_timeout_secs, 300);
+        // Explicit keys override the defaults.
+        let cfg: DiscordAdapterConfig =
+            serde_json::from_value(json!({ "http_timeout_secs": 9, "send_worker_count": 2 })).unwrap();
+        assert_eq!(cfg.http_timeout_secs, 9);
+        assert_eq!(cfg.send_worker_count, 2);
+        assert_eq!(cfg.prompt_timeout_secs, 300);
     }
 }
