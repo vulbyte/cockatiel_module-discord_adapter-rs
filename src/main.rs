@@ -351,6 +351,42 @@ fn backfill_tuning_defaults() {
     }
 }
 
+/// Expected `.env` keys for this adapter. Each is a SECRET with no meaningful
+/// default, so it is written EMPTY as a placeholder — the operator (or the TUI
+/// credential flow) fills the value in. A real environment variable always wins
+/// over the file at load (load_env_file only sets unset vars).
+const ENV_KEYS: &[&str] = &["DISCORD_BOT_TOKEN"];
+
+/// Create `.env` if missing and ensure every expected key is present (empty
+/// `KEY=` line). Existing keys/values are NEVER overwritten. The file is kept
+/// owner-only (0o600 on unix) since it holds secrets.
+fn ensure_env_file() {
+    ensure_env_file_at(std::path::Path::new(".env"));
+}
+
+fn ensure_env_file_at(path: &std::path::Path) {
+    let mut lines: Vec<String> = std::fs::read_to_string(path)
+        .map(|c| c.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default();
+    for key in ENV_KEYS {
+        let prefix = format!("{}=", key);
+        if !lines.iter().any(|l| l.trim().starts_with(&prefix)) {
+            lines.push(prefix);
+        }
+    }
+    let mut content = lines.join("\n");
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if std::fs::write(path, content).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 fn load_adapter_config() -> Option<DiscordAdapterConfig> {
     // The bot token is a secret → .env (loaded into env at startup, with a
     // config.json fallback for pre-migration installs). The servers map is
@@ -1438,6 +1474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config (non-interactive fast path — the TUI supplies credentials).
     // The bot token is a secret (`.env`); the server→channel map is public
     // (config.json).
+    ensure_env_file();
     cockatiel_client::load_env_file(".env");
     let mut bot_token = std::env::var("DISCORD_BOT_TOKEN").unwrap_or_default();
     let mut servers: std::collections::HashMap<String, ServerChannels> = Default::default();
@@ -1760,7 +1797,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig};
+    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig, ensure_env_file_at, ENV_KEYS};
     use serde_json::json;
 
     #[test]
@@ -1900,5 +1937,44 @@ mod tests {
         assert_eq!(cfg.http_timeout_secs, 9);
         assert_eq!(cfg.send_worker_count, 2);
         assert_eq!(cfg.prompt_timeout_secs, 300);
+    }
+
+    #[test]
+    fn ensure_env_file_creates_and_merges_placeholders() {
+        let dir = std::env::temp_dir().join(format!("discord_env_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        let _ = std::fs::remove_file(&path);
+
+        // Missing file: created with every expected key as an EMPTY placeholder.
+        ensure_env_file_at(&path);
+        let created = std::fs::read_to_string(&path).unwrap();
+        for key in ENV_KEYS {
+            assert!(created.lines().any(|l| l == format!("{}=", key)), "{} missing", key);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, ".env must be owner-only");
+        }
+
+        // Existing non-empty values preserved; missing keys appended once.
+        let first = format!("{}=", ENV_KEYS[0]);
+        std::fs::write(&path, format!("{}{}\nSOME_OTHER=keep\n", first, "abc")).unwrap();
+        ensure_env_file_at(&path);
+        let merged = std::fs::read_to_string(&path).unwrap();
+        assert!(merged.contains(&format!("{}{}", first, "abc")), "existing value overwritten");
+        assert!(merged.contains("SOME_OTHER=keep"), "unrelated key dropped");
+        assert_eq!(merged.matches(&first).count(), 1, "existing key line duplicated");
+        for key in ENV_KEYS {
+            assert!(
+                merged.lines().any(|l| l.starts_with(&format!("{}=", key))),
+                "{} missing after merge",
+                key
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
