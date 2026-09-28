@@ -38,7 +38,7 @@
     {
       "env": "",
       "key": "servers",
-      "label": "Servers (guild_id=ch1,ch2 or guild_id=*, one per line)",
+      "label": "Servers to monitor, one per line. '*' on its own = every server the bot is in. 'GUILD_ID' or 'GUILD_ID=*' = that server, every channel. 'GUILD_ID=ch1,ch2' = that server, only those channels. GUILD_ID is the Server ID (enable Developer Mode, then right-click the server > Copy Server ID). Channel filtering cannot be combined with '*'.",
       "list": true,
       "optional": false,
       "sensitive": false
