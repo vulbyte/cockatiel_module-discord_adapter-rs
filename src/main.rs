@@ -734,6 +734,50 @@ fn bot_auth(req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilde
     req.header(reqwest::header::AUTHORIZATION, bot_auth_value(token))
 }
 
+/// Push a guild's approximate member count to the engine via a `ChannelStats`
+/// payload. The engine stores it and serves it to other modules through the
+/// `channel_viewers` virtual query. Reads the session identity at send time.
+async fn push_channel_stats(
+    write_ws: &Arc<Mutex<WsWriteHalf>>,
+    identity: &Arc<Mutex<EngineIdentity>>,
+    platform: &str,
+    channel: &str,
+    viewers: i64,
+    is_live: bool,
+    title: &str,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let container = Container {
+        version: 1,
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
+        payload: Some(Payload::ChannelStats(cockatiel_client::proto::ChannelStats {
+            platform: platform.to_string(),
+            channel: channel.to_string(),
+            viewers,
+            is_live,
+            title: title.to_string(),
+            updated_at: now_unix_millis(),
+        })),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write_ws.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
+    }
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Build a client for Discord REST calls: a hard per-request timeout so a hung
 /// connection can't wedge a task forever, plus the User-Agent Discord
 /// documents as mandatory. A builder failure falls back to the default client
@@ -919,6 +963,37 @@ async fn guild_channels(client: &reqwest::Client, token: &str, guild_id: &str) -
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Parse the member count out of a `GET /guilds/{id}?with_counts=true` body.
+fn guild_member_count_from_body(v: &serde_json::Value) -> Option<i64> {
+    v.get("approximate_member_count").and_then(|c| c.as_i64())
+}
+
+/// Fetch a guild's approximate member count via `GET /guilds/{id}?with_counts=true`.
+/// This is the "members who have access to the server" metric the adapter
+/// reports in place of a viewer count (Discord has no live-stream concept).
+async fn guild_member_count(
+    client: &reqwest::Client,
+    token: &str,
+    guild_id: &str,
+) -> Option<i64> {
+    let Ok(resp) = bot_auth(
+        client.get(format!("{}/guilds/{}?with_counts=true", REST_API, guild_id)),
+        token,
+    )
+    .send()
+    .await
+    else {
+        return None;
+    };
+    if !resp.status().is_success() {
+        return None;
+    }
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return None;
+    };
+    guild_member_count_from_body(&v)
 }
 
 /// Text-capable channel IDs in a server (GUILD_TEXT + GUILD_ANNOUNCEMENT),
@@ -2260,6 +2335,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let embed_sends = load_adapter_config().map(|c| c.embed_sends).unwrap_or(false);
     *send_embed.lock().await = embed_sends;
 
+    // Member-count monitor: every poll interval, report each configured guild's
+    // approximate member count to the engine via ChannelStats (the Discord
+    // stand-in for a viewer count). Runs alongside the gateway task.
+    {
+        let http_monitor = http.clone();
+        let token_monitor = bot_token.clone();
+        let guilds: Vec<String> = servers.keys().cloned().collect();
+        let engine_write_monitor = engine_write.clone();
+        let identity_monitor = identity.clone();
+        // 30s matches the other adapters' default stream-poll intervals.
+        let interval_secs = 30u64;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // burn the immediate first tick
+            loop {
+                interval.tick().await;
+                for guild in &guilds {
+                    if let Some(count) =
+                        guild_member_count(&http_monitor, &token_monitor, guild).await
+                    {
+                        push_channel_stats(
+                            &engine_write_monitor,
+                            &identity_monitor,
+                            "discord",
+                            guild,
+                            count,
+                            true,
+                            "",
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
     // Discord gateway task — receive-only (all setup/validation happened above).
     info!("Connecting to Discord gateway...");
     run_discord_gateway(
@@ -2277,7 +2389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig, ensure_env_file_at, ENV_KEYS, bot_auth_value, build_http_client, check_discord_auth, retry_after_secs_from_body, describe_auth_failure, auth_retry_action, transient_backoff_secs, should_reset_rejection_budget, parse_servers_value, expand_guild_wildcard, plan_server_monitoring, ServerPlan, AuthAction, AuthFailure, MAX_AUTH_ATTEMPTS};
+    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig, ensure_env_file_at, ENV_KEYS, bot_auth_value, build_http_client, check_discord_auth, retry_after_secs_from_body, describe_auth_failure, auth_retry_action, transient_backoff_secs, should_reset_rejection_budget, parse_servers_value, expand_guild_wildcard, plan_server_monitoring, ServerPlan, AuthAction, AuthFailure, MAX_AUTH_ATTEMPTS, guild_member_count_from_body};
     use serde_json::json;
     use wiremock::matchers::{header_regex, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3021,5 +3133,22 @@ mod tests {
                 cfg
             );
         }
+    }
+
+    #[test]
+    fn guild_member_count_parses_approximate_member_count() {
+        let body = serde_json::json!({
+            "id": "111222",
+            "name": "test guild",
+            "approximate_member_count": 1234,
+            "approximate_presence_count": 300
+        });
+        assert_eq!(guild_member_count_from_body(&body), Some(1234));
+        assert_eq!(guild_member_count_from_body(&serde_json::json!({})), None);
+        assert_eq!(
+            guild_member_count_from_body(&serde_json::json!({"approximate_member_count": "nope"})),
+            None,
+            "a non-integer member count is not parsed"
+        );
     }
 }
