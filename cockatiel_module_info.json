@@ -1,4 +1,5 @@
 {
+  "authority": 0,
   "autostart": true,
   "binary": {
     "linux": {
@@ -46,10 +47,9 @@
   ],
   "description": "reads + sends Discord chat and mod commands. Needs a bot token + Server ID (enable the Message Content intent and invite the bot with Read/Send/Moderate perms).",
   "launch_command": "cargo run",
-  "name": "discord-adapter",
-  "root_file": "./src/main.rs",
-  "version": "0.1.0",
-  "price": 0,
   "min_rank": 0,
-  "authority": 0
+  "name": "discord-adapter",
+  "price": 0,
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
 }
