@@ -10,7 +10,10 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient, PromptKind};
+use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
+use cockatiel_client::proto::container_for_module::Payload as ModulePayload;
+use cockatiel_client::proto::*;
+use cockatiel_client::{CockatielClient, PromptKind};
 
 // GUILD_MESSAGES (1<<9) + MESSAGE_CONTENT (1<<15). MESSAGE_CONTENT is a
 // privileged intent — enable it in the Discord Developer Portal for the bot.
@@ -74,12 +77,12 @@ async fn register_commands(
         let id = identity.lock().await;
         (id.auth.clone(), id.module.clone(), id.instance.clone())
     };
-    let commands = Container {
-        version: 1,
+    let commands = ContainerForEngine {
+        version: 2,
         auth_token: auth.clone(),
         module_name: module.clone(),
         module_instance_uuid7: instance.clone(),
-        payload: Some(Payload::CommandsPayload(Commands {
+        payload: Some(EnginePayload::Commands(Commands {
             commands: vec![
                 Command {
                     command_name: "ban".to_string(),
@@ -750,12 +753,12 @@ async fn push_channel_stats(
         let id = identity.lock().await;
         (id.auth.clone(), id.module.clone(), id.instance.clone())
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForEngine {
+        version: 2,
         auth_token: auth,
         module_name: module,
         module_instance_uuid7: instance,
-        payload: Some(Payload::ChannelStats(cockatiel_client::proto::ChannelStats {
+        payload: Some(EnginePayload::ChannelStats(cockatiel_client::proto::ChannelStats {
             platform: platform.to_string(),
             channel: channel.to_string(),
             viewers,
@@ -1318,12 +1321,12 @@ async fn handle_message_create(
         let id = identity.lock().await;
         (id.auth.clone(), id.module.clone(), id.instance.clone())
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForEngine {
+        version: 2,
         auth_token: auth,
         module_name: module,
         module_instance_uuid7: instance,
-        payload: Some(Payload::MessagePreProcess(pre)),
+        payload: Some(EnginePayload::MessagePreProcess(pre)),
     };
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_ok() {
@@ -1369,12 +1372,12 @@ async fn prompt_for_input(
         input_label: input_label.to_string(),
         prompt_type: prompt_type as i32,
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForEngine {
+        version: 2,
         auth_token: auth_token.to_string(),
         module_name: module_name.to_string(),
         module_instance_uuid7: instance_uuid.to_string(),
-        payload: Some(Payload::Prompt(prompt)),
+        payload: Some(EnginePayload::Prompt(prompt)),
     };
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_err() {
@@ -2111,7 +2114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Read until the connection dies.
                 while let Some(msg) = read.next().await {
                     let Ok(WsMessage::Binary(data)) = msg else { continue };
-                    let Ok(container) = Container::decode(data.as_ref()) else { continue };
+                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
                     let Some(payload) = container.payload else { continue };
                     // Use the CURRENT session identity (a reconnect swaps it).
                     let (auth, instance, module) = {
@@ -2121,13 +2124,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match payload {
                         // Answer the engine's liveness probe with our auth token
                         // so a quiet period never severs us as unresponsive.
-                        Payload::AuthVerify(_) => {
-                            let reply = Container {
-                                version: 1,
+                        ModulePayload::AuthVerify(_) => {
+                            let reply = ContainerForEngine {
+                                version: 2,
                                 auth_token: auth.clone(),
                                 module_name: module.clone(),
                                 module_instance_uuid7: instance.clone(),
-                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                payload: Some(EnginePayload::AuthVerify(AuthVerify {
                                     cur_auth: auth.clone(),
                                 })),
                             };
@@ -2137,7 +2140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = w.send(WsMessage::Binary(buf)).await;
                             }
                         }
-                        Payload::SendToPlatforms(send) => {
+                        ModulePayload::SendToPlatforms(send) => {
                             let token = token_state.lock().await.clone();
                             let channels = channels_state.lock().await.clone();
                             let embed = *embed_state.lock().await;
@@ -2169,13 +2172,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        Payload::PromptResponse(resp) => {
+                        ModulePayload::PromptResponse(resp) => {
                             // Forward operator answers to the awaiting prompt.
                             let _ = prompt_tx.send(resp);
                         }
                         // Routed chat command: the engine parsed `!ban` / `!timeout`
                         // and delivered it here with the parsed Command attached.
-                        Payload::MessagePreProcess(pre) => {
+                        ModulePayload::MessagePreProcess(pre) => {
                             let uuid = pre.message_uuid7.clone();
                             let Some(chat) = pre.raw_message else { continue };
                             let Some(cmd) = chat.command.as_ref() else { continue };
@@ -2193,12 +2196,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &author,
                                 tuning_task.default_timeout_secs,
                             ) {
-                                let query = Container {
-                                    version: 1,
+                                let query = ContainerForEngine {
+                                    version: 2,
                                     auth_token: auth.clone(),
                                     module_name: module.clone(),
                                     module_instance_uuid7: instance.clone(),
-                                    payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                    payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
                                         query_id: qid,
                                         sql: payload.to_string(),
                                         params: vec![],
@@ -2215,12 +2218,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // this message pre-processed. Without this the command
                             // message strands in the pipeline until the engine's
                             // timeout sweep.
-                            let ack = Container {
-                                version: 1,
+                            let ack = ContainerForEngine {
+                                version: 2,
                                 auth_token: auth.clone(),
                                 module_name: module.clone(),
                                 module_instance_uuid7: instance.clone(),
-                                payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+                                payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
                                     audio: vec![],
                                     audio_type: String::new(),
                                     message_uuid7: uuid,
@@ -2311,12 +2314,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Surface the setup summary to the operator (the accumulated log).
     if !setup_log.trim().is_empty() {
-        let log = Container {
-            version: 1,
+        let log = ContainerForEngine {
+            version: 2,
             auth_token: auth_token.clone(),
             module_name: module_name.clone(),
             module_instance_uuid7: instance_uuid.clone(),
-            payload: Some(Payload::Log(cockatiel_client::proto::Log {
+            payload: Some(EnginePayload::Log(cockatiel_client::proto::Log {
                 log: format!("[discord-adapter] setup:\n{}", setup_log.trim_end()),
                 blob: vec![],
             })),

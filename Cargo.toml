@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cockatiel-client = { git = "https://github.com/vulbyte/cockatiel_client-rs", rev = "d8018510768ce09d1dcd61a1770b7356299af261" }
+cockatiel-client = { git = "https://github.com/vulbyte/cockatiel_client-rs", rev = "24464af1b6664c88bde4b22ad6326dd40223c40c" }
 tokio = { version = "1.38", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
