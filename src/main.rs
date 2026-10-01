@@ -17,14 +17,14 @@ use cockatiel_client::{CockatielClient, PromptKind};
 
 // GUILD_MESSAGES (1<<9) + MESSAGE_CONTENT (1<<15). MESSAGE_CONTENT is a
 // privileged intent — enable it in the Discord Developer Portal for the bot.
-const DISCORD_INTENTS: u64 = (1 << 9) | (1 << 15);
+const DISCORD_INTENTS: u32 = (1 << 9) | (1 << 15);
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const REST_API: &str = "https://discord.com/api/v10";
 /// Discord requires a User-Agent on every API request.
 const USER_AGENT: &str = "cockatiel-discord-adapter/0.1.0";
 /// Per-request ceiling for a `GET /users/@me` token check, independent of the
 /// client-wide timeout, so a hung socket can't wedge the setup phase.
-const AUTH_CHECK_TIMEOUT_SECS: u64 = 10;
+const AUTH_CHECK_TIMEOUT_SECS: u32 = 10;
 /// Consecutive rejections tolerated for ONE token before the setup phase gives
 /// up and lets the supervisor restart the module. A newly submitted token gets
 /// a full budget (see [`should_reset_rejection_budget`]); re-submitting the
@@ -63,7 +63,7 @@ struct DiscordSendJob {
     channel_id: String,
     msg: String,
     embed: bool,
-    http_timeout_secs: u64,
+    http_timeout_secs: u32,
 }
 
 /// Re-register the adapter's chat commands with the engine (called on the
@@ -278,46 +278,46 @@ struct DiscordAdapterConfig {
     // previous hardcoded constant when the key is missing from config.json,
     // so an absent setting behaves exactly as before.
     #[serde(default = "DiscordAdapterConfig::default_timeout_secs")]
-    default_timeout_secs: i64,
+    default_timeout_secs: i32,
     #[serde(default = "DiscordAdapterConfig::http_timeout_secs")]
-    http_timeout_secs: u64,
+    http_timeout_secs: u32,
     #[serde(default = "DiscordAdapterConfig::gateway_auth_backoff_base_secs")]
-    gateway_auth_backoff_base_secs: u64,
+    gateway_auth_backoff_base_secs: u32,
     #[serde(default = "DiscordAdapterConfig::gateway_auth_backoff_max_secs")]
-    gateway_auth_backoff_max_secs: u64,
+    gateway_auth_backoff_max_secs: u32,
     #[serde(default = "DiscordAdapterConfig::gateway_connect_retry_secs")]
-    gateway_connect_retry_secs: u64,
+    gateway_connect_retry_secs: u32,
     #[serde(default = "DiscordAdapterConfig::gateway_reconnect_delay_secs")]
-    gateway_reconnect_delay_secs: u64,
+    gateway_reconnect_delay_secs: u32,
     #[serde(default = "DiscordAdapterConfig::outbound_queue_cap")]
     outbound_queue_cap: usize,
     #[serde(default = "DiscordAdapterConfig::send_worker_count")]
     send_worker_count: usize,
     #[serde(default = "DiscordAdapterConfig::reconnect_base_secs")]
-    reconnect_base_secs: u64,
+    reconnect_base_secs: u32,
     #[serde(default = "DiscordAdapterConfig::reconnect_max_secs")]
-    reconnect_max_secs: u64,
+    reconnect_max_secs: u32,
     #[serde(default = "DiscordAdapterConfig::prompt_timeout_secs")]
     prompt_timeout_secs: u32,
 }
 
 impl DiscordAdapterConfig {
-    fn default_timeout_secs() -> i64 {
+    fn default_timeout_secs() -> i32 {
         300
     }
-    fn http_timeout_secs() -> u64 {
+    fn http_timeout_secs() -> u32 {
         15
     }
-    fn gateway_auth_backoff_base_secs() -> u64 {
+    fn gateway_auth_backoff_base_secs() -> u32 {
         1
     }
-    fn gateway_auth_backoff_max_secs() -> u64 {
+    fn gateway_auth_backoff_max_secs() -> u32 {
         30
     }
-    fn gateway_connect_retry_secs() -> u64 {
+    fn gateway_connect_retry_secs() -> u32 {
         5
     }
-    fn gateway_reconnect_delay_secs() -> u64 {
+    fn gateway_reconnect_delay_secs() -> u32 {
         5
     }
     fn outbound_queue_cap() -> usize {
@@ -326,10 +326,10 @@ impl DiscordAdapterConfig {
     fn send_worker_count() -> usize {
         4
     }
-    fn reconnect_base_secs() -> u64 {
+    fn reconnect_base_secs() -> u32 {
         1
     }
-    fn reconnect_max_secs() -> u64 {
+    fn reconnect_max_secs() -> u32 {
         30
     }
     fn prompt_timeout_secs() -> u32 {
@@ -363,16 +363,16 @@ impl Default for DiscordAdapterConfig {
 /// held the hardcoded literals.
 #[derive(Debug, Clone)]
 struct Tuning {
-    default_timeout_secs: i64,
-    http_timeout_secs: u64,
-    gateway_auth_backoff_base_secs: u64,
-    gateway_auth_backoff_max_secs: u64,
-    gateway_connect_retry_secs: u64,
-    gateway_reconnect_delay_secs: u64,
+    default_timeout_secs: i32,
+    http_timeout_secs: u32,
+    gateway_auth_backoff_base_secs: u32,
+    gateway_auth_backoff_max_secs: u32,
+    gateway_connect_retry_secs: u32,
+    gateway_reconnect_delay_secs: u32,
     outbound_queue_cap: usize,
     send_worker_count: usize,
-    reconnect_base_secs: u64,
-    reconnect_max_secs: u64,
+    reconnect_base_secs: u32,
+    reconnect_max_secs: u32,
     prompt_timeout_secs: u32,
 }
 
@@ -638,7 +638,7 @@ fn build_mod_query(
     command_name: &str,
     message: &str,
     author: &str,
-    default_timeout_secs: i64,
+    default_timeout_secs: i32,
 ) -> Option<(String, serde_json::Value)> {
     let mut tokens = message.split_whitespace();
     let _cmd = tokens.next()?;
@@ -650,12 +650,12 @@ fn build_mod_query(
             }
             // Discord bans are permanent — a timed ban (`!ban @user -d 300`) is
             // a timeout instead (matches how the engine's mod_timeout works).
-            let mut duration_secs: Option<i64> = None;
+            let mut duration_secs: Option<i32> = None;
             let mut reason = tokens.collect::<Vec<_>>().join(" ");
             if let Some(dpos) = reason.find("-d") {
                 let after = reason[dpos + 2..].trim();
                 let (num, _) = after.split_once(char::is_whitespace).unwrap_or((after, ""));
-                if let Ok(secs) = num.parse::<i64>() {
+                if let Ok(secs) = num.parse::<i32>() {
                     duration_secs = Some(secs.max(1));
                     reason = format!("{}{}", reason[..dpos].trim(), after[num.len()..].trim());
                 }
@@ -691,7 +691,7 @@ fn build_mod_query(
             let mut duration_secs = default_timeout_secs;
             let mut reason = String::new();
             if let Some(d) = tokens.next() {
-                if let Ok(secs) = d.parse::<i64>() {
+                if let Ok(secs) = d.parse::<i32>() {
                     duration_secs = secs;
                 } else {
                     reason = d.to_string();
@@ -785,9 +785,9 @@ fn now_unix_millis() -> i64 {
 /// connection can't wedge a task forever, plus the User-Agent Discord
 /// documents as mandatory. A builder failure falls back to the default client
 /// rather than taking the module down.
-fn build_http_client(http_timeout_secs: u64) -> reqwest::Client {
+fn build_http_client(http_timeout_secs: u32) -> reqwest::Client {
     match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(http_timeout_secs))
+        .timeout(std::time::Duration::from_secs(http_timeout_secs as u64))
         .user_agent(USER_AGENT)
         .build()
     {
@@ -808,7 +808,7 @@ async fn send_discord_message(
     channel_id: &str,
     msg: &str,
     embed: bool,
-    timeout_secs: u64,
+    timeout_secs: u32,
 ) -> Result<(), String> {
     // `embed_sends: true` posts a discordjs-style embed instead of a plain
     // message (ROADMAP: "receive a Send and post as an embed").
@@ -822,7 +822,7 @@ async fn send_discord_message(
         token,
     )
     .json(&body)
-    .timeout(std::time::Duration::from_secs(timeout_secs))
+    .timeout(std::time::Duration::from_secs(timeout_secs as u64))
     .send()
     .await
     .map_err(|e| format!("send request failed: {}", e))?;
@@ -898,7 +898,7 @@ async fn check_discord_auth(
     token: &str,
 ) -> Result<(), AuthFailure> {
     let resp = bot_auth(client.get(format!("{}/users/@me", base_url)), token)
-        .timeout(std::time::Duration::from_secs(AUTH_CHECK_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(AUTH_CHECK_TIMEOUT_SECS as u64))
         .send()
         .await
         .map_err(|e| AuthFailure::Transport { detail: e.to_string() })?;
@@ -1085,7 +1085,7 @@ async fn run_discord_gateway(
                     e, tuning.gateway_connect_retry_secs
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(
-                    tuning.gateway_connect_retry_secs,
+                    tuning.gateway_connect_retry_secs as u64,
                 ))
                 .await;
                 continue;
@@ -1207,7 +1207,7 @@ async fn run_discord_gateway(
                 "Discord gateway auth failed — the bot token is rejected. Backing off {}s before retrying (a fixed retry would hammer the gateway / trip close code 4008).",
                 auth_backoff
             );
-            tokio::time::sleep(std::time::Duration::from_secs(auth_backoff)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(auth_backoff as u64)).await;
             auth_backoff = (auth_backoff * 2).min(tuning.gateway_auth_backoff_max_secs);
         } else {
             auth_backoff = tuning.gateway_auth_backoff_base_secs;
@@ -1216,7 +1216,7 @@ async fn run_discord_gateway(
                 tuning.gateway_reconnect_delay_secs
             );
             tokio::time::sleep(std::time::Duration::from_secs(
-                tuning.gateway_reconnect_delay_secs,
+                tuning.gateway_reconnect_delay_secs as u64,
             ))
             .await;
         }
@@ -2264,7 +2264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Engine disconnected — reconnecting...");
                 let mut backoff = tuning_task.reconnect_base_secs;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff as u64)).await;
                     match CockatielClient::connect("config.json").await {
                         Ok(conn) => {
                             info!("Reconnected to engine");
