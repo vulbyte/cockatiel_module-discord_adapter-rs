@@ -2179,6 +2179,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Routed chat command: the engine parsed `!ban` / `!timeout`
                         // and delivered it here with the parsed Command attached.
                         ModulePayload::MessagePreProcess(pre) => {
+                            // Receipt ping: confirm delivery to the engine
+                            // IMMEDIATELY (pure ack, separate from the stage
+                            // echo below) so the engine doesn't resend.
+                            if !pre.message_uuid7.is_empty() {
+                                let receipt = ContainerForEngine {
+                                    version: 2,
+                                    auth_token: auth.clone(),
+                                    module_name: module.clone(),
+                                    module_instance_uuid7: instance.clone(),
+                                    payload: Some(EnginePayload::MessageAck(MessageAck {
+                                        message_uuid7: pre.message_uuid7.clone(),
+                                    })),
+                                };
+                                let mut rbuf = Vec::new();
+                                if receipt.encode(&mut rbuf).is_ok() {
+                                    let mut w = engine_write.lock().await;
+                                    let _ = w.send(WsMessage::Binary(rbuf)).await;
+                                }
+                            }
                             let uuid = pre.message_uuid7.clone();
                             let Some(chat) = pre.raw_message else { continue };
                             let Some(cmd) = chat.command.as_ref() else { continue };
