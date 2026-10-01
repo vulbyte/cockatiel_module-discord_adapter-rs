@@ -25,6 +25,7 @@
   ],
   "capabilities": "input",
   "command_flags": [
+    "run",
     "--release"
   ],
   "credentials": [
@@ -46,7 +47,7 @@
     }
   ],
   "description": "reads + sends Discord chat and mod commands. Needs a bot token + Server ID (enable the Message Content intent and invite the bot with Read/Send/Moderate perms).",
-  "launch_command": "cargo run",
+  "launch_command": "cargo",
   "min_rank": 0,
   "name": "discord-adapter",
   "price": 0,
