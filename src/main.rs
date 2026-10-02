@@ -745,7 +745,7 @@ async fn push_channel_stats(
     identity: &Arc<Mutex<EngineIdentity>>,
     platform: &str,
     channel: &str,
-    viewers: i64,
+    viewers: i32,
     is_live: bool,
     title: &str,
 ) {
@@ -969,8 +969,9 @@ async fn guild_channels(client: &reqwest::Client, token: &str, guild_id: &str) -
 }
 
 /// Parse the member count out of a `GET /guilds/{id}?with_counts=true` body.
-fn guild_member_count_from_body(v: &serde_json::Value) -> Option<i64> {
-    v.get("approximate_member_count").and_then(|c| c.as_i64())
+fn guild_member_count_from_body(v: &serde_json::Value) -> Option<i32> {
+    v.get("approximate_member_count")
+        .and_then(|c| c.as_i64().map(|n| n as i32))
 }
 
 /// Fetch a guild's approximate member count via `GET /guilds/{id}?with_counts=true`.
@@ -980,7 +981,7 @@ async fn guild_member_count(
     client: &reqwest::Client,
     token: &str,
     guild_id: &str,
-) -> Option<i64> {
+) -> Option<i32> {
     let Ok(resp) = bot_auth(
         client.get(format!("{}/guilds/{}?with_counts=true", REST_API, guild_id)),
         token,
