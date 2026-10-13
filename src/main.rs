@@ -2256,6 +2256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = w.send(WsMessage::Binary(abuf)).await;
                             }
                         }
+                        ModulePayload::Shutdown(_) => {
+                            info!("Engine requested shutdown — exiting");
+                            std::process::exit(0);
+                        }
                         _ => {}
                     }
                 }
