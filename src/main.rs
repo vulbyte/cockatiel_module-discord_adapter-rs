@@ -64,6 +64,22 @@ struct DiscordSendJob {
     msg: String,
     embed: bool,
     http_timeout_secs: u32,
+    /// Optional proxied identity (the Discord RP "possess" feature): post
+    /// through a per-(channel, character) webhook instead of the bot so the
+    /// message appears to come from that character.
+    proxy: Option<ProxyJob>,
+    /// Optional platform message id to delete AFTER a successful post — the RP
+    /// trigger message the proxy replaces. Empty = nothing to delete.
+    delete_message_id: String,
+}
+
+/// A proxied identity: the character's key (the webhook cache key), display
+/// name, and avatar bytes (empty = reuse the cached webhook's avatar as-is).
+#[derive(Clone)]
+struct ProxyJob {
+    character_key: String,
+    display_name: String,
+    avatar: Vec<u8>,
 }
 
 /// Re-register the adapter's chat commands with the engine (called on the
@@ -832,6 +848,194 @@ async fn send_discord_message(
     } else {
         let text = resp.text().await.unwrap_or_default();
         Err(format!("Discord send {}: {}", status, text))
+    }
+}
+
+// ── Proxied sends (Discord RP "possess") ──────────────────────────────
+
+/// Cache of (channel, character_key) -> (webhook id, webhook token), so a
+/// proxied send reuses the character's webhook instead of re-creating it.
+type WebhookCache = std::sync::Mutex<std::collections::HashMap<String, (String, String)>>;
+
+fn webhook_cache_key(channel_id: &str, character_key: &str) -> String {
+    format!("{channel_id}\u{1f}{character_key}")
+}
+
+/// A `data:<mime>;base64,…` URI for a webhook avatar (what `PATCH /webhooks/{id}`
+/// expects). The mime is sniffed from the bytes, defaulting to PNG.
+fn avatar_data_uri(bytes: &[u8]) -> String {
+    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else {
+        "image/png"
+    };
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("data:{mime};base64,{b64}")
+}
+
+/// Resolve (creating if needed) the webhook for a (channel, character), caching
+/// its id+token. The webhook's OWN name/avatar carry the character's identity,
+/// so executing it posts as that character. The avatar is only (re)set when the
+/// caller supplies bytes (empty = reuse as-is), keeping the bytes off the
+/// per-message hot path.
+async fn ensure_webhook(
+    client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+    cache: &WebhookCache,
+    proxy: &ProxyJob,
+    timeout_secs: u32,
+) -> Result<(String, String), String> {
+    let key = webhook_cache_key(channel_id, &proxy.character_key);
+    let cached = { cache.lock().unwrap().get(&key).cloned() };
+    if let Some((id, wtoken)) = cached {
+        if !proxy.avatar.is_empty() {
+            patch_webhook_avatar(client, token, &id, &proxy.avatar, timeout_secs).await?;
+        }
+        return Ok((id, wtoken));
+    }
+
+    let name: &str = if proxy.display_name.is_empty() {
+        "Cockatiel RP"
+    } else {
+        proxy.display_name.as_str()
+    };
+    let resp = bot_auth(
+        client.post(format!("{}/channels/{}/webhooks", REST_API, channel_id)),
+        token,
+    )
+    .json(&json!({ "name": name }))
+    .timeout(std::time::Duration::from_secs(timeout_secs as u64))
+    .send()
+    .await
+    .map_err(|e| format!("webhook create request failed: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "webhook create {}: {}",
+            status,
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("webhook create parse: {}", e))?;
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("webhook create: no id")?
+        .to_string();
+    let wtoken = body
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or("webhook create: no token")?
+        .to_string();
+    if !proxy.avatar.is_empty() {
+        patch_webhook_avatar(client, token, &id, &proxy.avatar, timeout_secs).await?;
+    }
+    cache
+        .lock()
+        .unwrap()
+        .insert(key, (id.clone(), wtoken.clone()));
+    Ok((id, wtoken))
+}
+
+/// Set a webhook's avatar from raw image bytes.
+async fn patch_webhook_avatar(
+    client: &reqwest::Client,
+    token: &str,
+    webhook_id: &str,
+    avatar: &[u8],
+    timeout_secs: u32,
+) -> Result<(), String> {
+    let resp = bot_auth(
+        client.patch(format!("{}/webhooks/{}", REST_API, webhook_id)),
+        token,
+    )
+    .json(&json!({ "avatar": avatar_data_uri(avatar) }))
+    .timeout(std::time::Duration::from_secs(timeout_secs as u64))
+    .send()
+    .await
+    .map_err(|e| format!("webhook avatar request failed: {}", e))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "webhook avatar {}: {}",
+            status,
+            resp.text().await.unwrap_or_default()
+        ))
+    }
+}
+
+/// Execute a webhook (post `content` as the webhook's name+avatar). Mentions are
+/// suppressed so a proxied message cannot ping anyone.
+async fn execute_webhook(
+    client: &reqwest::Client,
+    webhook_id: &str,
+    webhook_token: &str,
+    content: &str,
+    timeout_secs: u32,
+) -> Result<(), String> {
+    let resp = client
+        .post(format!(
+            "{}/webhooks/{}/{}",
+            REST_API, webhook_id, webhook_token
+        ))
+        .json(&json!({ "content": content, "allowed_mentions": { "parse": [] } }))
+        .timeout(std::time::Duration::from_secs(timeout_secs as u64))
+        .send()
+        .await
+        .map_err(|e| format!("webhook execute request failed: {}", e))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "webhook execute {}: {}",
+            status,
+            resp.text().await.unwrap_or_default()
+        ))
+    }
+}
+
+/// Delete a channel message by id (the RP trigger a proxy replaces). Requires
+/// Manage Messages for a message the bot did not send. A 404 counts as success
+/// (already gone).
+async fn delete_discord_message(
+    client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+    message_id: &str,
+    timeout_secs: u32,
+) -> Result<(), String> {
+    let resp = bot_auth(
+        client.delete(format!(
+            "{}/channels/{}/messages/{}",
+            REST_API, channel_id, message_id
+        )),
+        token,
+    )
+    .timeout(std::time::Duration::from_secs(timeout_secs as u64))
+    .send()
+    .await
+    .map_err(|e| format!("delete request failed: {}", e))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 404 {
+        Ok(())
+    } else {
+        Err(format!(
+            "delete {}: {}",
+            status,
+            resp.text().await.unwrap_or_default()
+        ))
     }
 }
 
@@ -2100,12 +2304,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // means a reply flood can't spawn unbounded tasks or pile up memory.
             let (send_tx, send_rx) = mpsc::channel::<DiscordSendJob>(tuning_task.outbound_queue_cap);
             let send_rx = Arc::new(Mutex::new(send_rx));
+            // Shared (channel, character) -> webhook cache for proxied sends.
+            let webhook_cache: Arc<WebhookCache> = Arc::new(WebhookCache::default());
             for _ in 0..tuning_task.send_worker_count {
                 let rx = send_rx.clone();
+                let webhook_cache = webhook_cache.clone();
                 tokio::spawn(async move {
                     while let Some(job) = { let mut guard = rx.lock().await; guard.recv().await } {
-                        match send_discord_message(&job.client, &job.token, &job.channel_id, &job.msg, job.embed, job.http_timeout_secs).await {
-                            Ok(()) => info!("Sent to Discord channel {}: {}", job.channel_id, job.msg),
+                        // A proxied job posts through the character's webhook;
+                        // a normal job posts as the bot.
+                        let posted = match &job.proxy {
+                            Some(proxy) => match ensure_webhook(
+                                &job.client,
+                                &job.token,
+                                &job.channel_id,
+                                &webhook_cache,
+                                proxy,
+                                job.http_timeout_secs,
+                            )
+                            .await
+                            {
+                                Ok((id, wtoken)) => execute_webhook(
+                                    &job.client,
+                                    &id,
+                                    &wtoken,
+                                    &job.msg,
+                                    job.http_timeout_secs,
+                                )
+                                .await
+                                .map(|()| format!("{} (as {})", job.msg, proxy.display_name)),
+                                Err(e) => Err(e),
+                            },
+                            None => send_discord_message(
+                                &job.client,
+                                &job.token,
+                                &job.channel_id,
+                                &job.msg,
+                                job.embed,
+                                job.http_timeout_secs,
+                            )
+                            .await
+                            .map(|()| job.msg.clone()),
+                        };
+                        match posted {
+                            Ok(what) => {
+                                info!("Sent to Discord channel {}: {}", job.channel_id, what);
+                                // Delete the RP trigger only AFTER the proxy has
+                                // landed, so the message never briefly vanishes.
+                                if !job.delete_message_id.is_empty() {
+                                    if let Err(e) = delete_discord_message(
+                                        &job.client,
+                                        &job.token,
+                                        &job.channel_id,
+                                        &job.delete_message_id,
+                                        job.http_timeout_secs,
+                                    )
+                                    .await
+                                    {
+                                        error!(
+                                            "failed to delete RP trigger {} in {}: {}",
+                                            job.delete_message_id, job.channel_id, e
+                                        );
+                                    }
+                                }
+                            }
                             Err(e) => error!("SendToPlatforms failed on {}: {}", job.channel_id, e),
                         }
                     }
@@ -2167,6 +2429,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     msg: send.msg.clone(),
                                     embed,
                                     http_timeout_secs: tuning_task.http_timeout_secs,
+                                    proxy: send.proxy.as_ref().map(|p| ProxyJob {
+                                        character_key: p.character_key.clone(),
+                                        display_name: p.display_name.clone(),
+                                        avatar: p.avatar.clone(),
+                                    }),
+                                    delete_message_id: send.delete_message_id.clone(),
                                 };
                                 if send_tx.try_send(job).is_err() {
                                     warn!("SendToPlatforms queue full — dropping reply to channel {}", ch);
@@ -2416,7 +2684,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig, ensure_env_file_at, ENV_KEYS, bot_auth_value, build_http_client, check_discord_auth, retry_after_secs_from_body, describe_auth_failure, auth_retry_action, transient_backoff_secs, should_reset_rejection_budget, parse_servers_value, expand_guild_wildcard, plan_server_monitoring, ServerPlan, AuthAction, AuthFailure, MAX_AUTH_ATTEMPTS, guild_member_count_from_body};
+    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig, ensure_env_file_at, ENV_KEYS, bot_auth_value, build_http_client, check_discord_auth, retry_after_secs_from_body, describe_auth_failure, auth_retry_action, transient_backoff_secs, should_reset_rejection_budget, parse_servers_value, expand_guild_wildcard, plan_server_monitoring, ServerPlan, AuthAction, AuthFailure, MAX_AUTH_ATTEMPTS, guild_member_count_from_body, avatar_data_uri, webhook_cache_key};
     use serde_json::json;
     use wiremock::matchers::{header_regex, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2431,6 +2699,34 @@ mod tests {
         assert_eq!(parse_tie_choice("EDIT"), Some(TieChoice::Edit));
         assert_eq!(parse_tie_choice("x"), None);
         assert_eq!(parse_tie_choice(""), None);
+    }
+
+    /// The RP avatar helper sniffs the image mime from magic bytes and builds
+    /// the `data:` URI Discord's webhook-avatar API expects.
+    #[test]
+    fn avatar_data_uri_sniffs_mime_and_encodes() {
+        assert!(avatar_data_uri(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+            .starts_with("data:image/png;base64,"));
+        assert!(avatar_data_uri(&[0xFF, 0xD8, 0xFF, 0xE0]).starts_with("data:image/jpeg;base64,"));
+        assert!(avatar_data_uri(b"GIF89a...").starts_with("data:image/gif;base64,"));
+        // Unknown magic → PNG fallback; the bytes base64-encode.
+        assert_eq!(avatar_data_uri(&[1, 2, 3]), "data:image/png;base64,AQID");
+    }
+
+    /// The webhook cache key must separate channels AND characters, so two
+    /// characters in one channel never collide (and the separator can't appear
+    /// in a Discord snowflake or a character key).
+    #[test]
+    fn webhook_cache_key_separates_channel_and_character() {
+        assert_eq!(webhook_cache_key("chan", "alice"), "chan\u{1f}alice");
+        assert_ne!(
+            webhook_cache_key("chan", "alice"),
+            webhook_cache_key("chan", "bob")
+        );
+        assert_ne!(
+            webhook_cache_key("c1", "alice"),
+            webhook_cache_key("c2", "alice")
+        );
     }
 
     #[test]
