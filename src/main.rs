@@ -283,6 +283,223 @@ async fn resolve_send_channels(
     merge_send_channels(servers, &all_channels)
 }
 
+// ── Threads ───────────────────────────────────────────────────────────
+//
+// A message posted in a Discord thread arrives with `channel_id` = the THREAD's
+// snowflake, not its parent channel's. The server policy
+// (`module_specific.servers`) lists parent channels, so without resolving the
+// parent a thread message is dropped whenever the server uses an explicit
+// channel list. MESSAGE_CREATE does not carry the parent, so a thread's parent
+// is resolved once via `GET /channels/{thread_id}` and cached.
+
+/// Discord thread channel types: 10 = announcement, 11 = public, 12 = private.
+fn is_thread_channel_type(ty: u64) -> bool {
+    matches!(ty, 10..=12)
+}
+
+/// Whether `channel_id` passes the policy, given its resolved thread parent
+/// (when it is a thread). Non-thread behaviour is unchanged: an unconfigured
+/// guild accepts nothing, `All` accepts everything, and `Some` accepts a
+/// directly-listed id. A thread is ADDITIONALLY accepted when its PARENT is
+/// listed. Pure so the decision is unit-testable without a live gateway.
+fn channel_allowed(
+    policy: Option<&ServerChannels>,
+    channel_id: &str,
+    parent_id: Option<&str>,
+) -> bool {
+    match policy {
+        None => false,
+        Some(ServerChannels::All) => true,
+        Some(ServerChannels::Some(chs)) => {
+            chs.iter().any(|c| c == channel_id)
+                || parent_id.is_some_and(|p| chs.iter().any(|c| c == p))
+        }
+    }
+}
+
+/// Whether the PARENT must be resolved to decide the policy for this channel.
+/// `All` and directly-listed channels already decide it, and an unconfigured
+/// guild is rejected outright — so those never pay a REST round-trip.
+fn needs_parent_lookup(policy: Option<&ServerChannels>, channel_id: &str) -> bool {
+    matches!(policy, Some(ServerChannels::Some(chs)) if !chs.iter().any(|c| c == channel_id))
+}
+
+/// A CHANNEL object parsed into a thread: its id plus parent (when carried).
+/// Returns None for any non-thread channel type (or a malformed object).
+fn thread_channel_from_object(obj: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let ty = obj.get("type").and_then(|t| t.as_u64())?;
+    if !is_thread_channel_type(ty) {
+        return None;
+    }
+    let id = obj.get("id").and_then(|v| v.as_str())?.to_string();
+    let parent = obj
+        .get("parent_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some((id, parent))
+}
+
+/// A thread this MESSAGE_CREATE payload names directly. A message only carries
+/// this for a thread's starter message, where `thread` is a channel object.
+///
+/// The message's OWN `type` is deliberately NOT read: that is a MessageType,
+/// whose 10/11/12 values are GUILD_BOOST_TIER_2 / GUILD_BOOST_TIER_3 /
+/// CHANNEL_FOLLOW_ADD — not thread channel types — so reading it here would
+/// misclassify boost/follow messages as threads.
+fn thread_from_payload(d: &serde_json::Value) -> Option<(String, Option<String>)> {
+    for key in ["thread", "channel"] {
+        if let Some(obj) = d.get(key) {
+            if let Some(parsed) = thread_channel_from_object(obj) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+/// What a `GET /channels/{id}` lookup told us about a channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelKind {
+    /// A thread (type 10/11/12) with the id of its parent channel.
+    Thread(String),
+    /// A non-thread channel, or a definitive HTTP status we cannot use
+    /// (403/404) — never re-queried.
+    NotThread,
+    /// Passed the policy without a lookup (`All` / a directly-listed channel).
+    /// Still worth resolving lazily for the RP webhook `thread_id`.
+    Unknown,
+}
+
+/// One cached channel resolution.
+#[derive(Debug, Clone)]
+struct ChannelEntry {
+    kind: ChannelKind,
+    /// This channel passed the policy, so an explicit engine send to it (e.g. a
+    /// reply into a monitored thread) is a valid target.
+    monitored: bool,
+}
+
+/// A bounded, FIFO thread→parent cache. Threads are numerous and long-lived and
+/// every within-thread MESSAGE_CREATE carries only the thread's own id, so the
+/// parent is remembered once per thread. Oldest entries are evicted past
+/// `capacity`, so the map can't grow without bound.
+struct ThreadCache {
+    capacity: usize,
+    entries: std::collections::HashMap<String, ChannelEntry>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl ThreadCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: Default::default(),
+            order: Default::default(),
+        }
+    }
+
+    /// Record a resolution (and/or the monitored flag) for a channel, evicting
+    /// the oldest entry once over capacity. The `monitored` flag is only ever
+    /// OR-ed in, so a later, purely informational resolution never demotes a
+    /// channel that already passed the policy.
+    fn observe(&mut self, channel_id: &str, kind: ChannelKind, monitored: bool) {
+        if !self.entries.contains_key(channel_id) {
+            self.order.push_back(channel_id.to_string());
+            while self.order.len() > self.capacity {
+                if let Some(old) = self.order.pop_front() {
+                    self.entries.remove(&old);
+                }
+            }
+        }
+        let entry = self
+            .entries
+            .entry(channel_id.to_string())
+            .or_insert_with(|| ChannelEntry {
+                kind: ChannelKind::NotThread,
+                monitored: false,
+            });
+        entry.kind = kind;
+        entry.monitored |= monitored;
+    }
+
+    fn get(&self, channel_id: &str) -> Option<&ChannelKind> {
+        self.entries.get(channel_id).map(|e| &e.kind)
+    }
+
+    fn is_monitored_target(&self, channel_id: &str) -> bool {
+        self.entries
+            .get(channel_id)
+            .map(|e| e.monitored)
+            .unwrap_or(false)
+    }
+}
+
+/// `GET {base_url}/channels/{id}` and classify it. `None` means the lookup was
+/// inconclusive (transport error / unparseable body) and must NOT be cached; any
+/// definite HTTP response maps to a `ChannelKind` so it is cached once.
+async fn fetch_channel_kind(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    channel_id: &str,
+    timeout_secs: u32,
+) -> Option<ChannelKind> {
+    let resp = bot_auth(
+        client.get(format!("{}/channels/{}", base_url, channel_id)),
+        token,
+    )
+    .timeout(std::time::Duration::from_secs(timeout_secs as u64))
+    .send()
+    .await
+    .ok()?;
+    let status = resp.status();
+    // Rate limits and 5xx are transient: don't poison the cache with a bogus
+    // "not a thread", or a monitored thread would be rejected until eviction.
+    if status.as_u16() == 429 || status.is_server_error() {
+        return None;
+    }
+    if !status.is_success() {
+        return Some(ChannelKind::NotThread);
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let ty = v.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
+    if is_thread_channel_type(ty) {
+        if let Some(parent) = v.get("parent_id").and_then(|p| p.as_str()) {
+            return Some(ChannelKind::Thread(parent.to_string()));
+        }
+    }
+    Some(ChannelKind::NotThread)
+}
+
+/// Resolve (with the cache) whether `channel_id` is a thread, returning its
+/// parent. `None` = not a thread, unknown, or the lookup failed. Cached so a
+/// thread is queried at most once; a monitored flag already on the entry is
+/// preserved.
+async fn resolve_thread_parent(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    channel_id: &str,
+    cache: &Arc<Mutex<ThreadCache>>,
+    timeout_secs: u32,
+) -> Option<String> {
+    if let Some(kind) = cache.lock().await.get(channel_id).cloned() {
+        match kind {
+            ChannelKind::Thread(parent) => return Some(parent),
+            ChannelKind::NotThread => return None,
+            // Registered by policy but never looked up — resolve it now.
+            ChannelKind::Unknown => {}
+        }
+    }
+    let kind = fetch_channel_kind(client, base_url, token, channel_id, timeout_secs).await?;
+    let parent = match &kind {
+        ChannelKind::Thread(parent) => Some(parent.clone()),
+        ChannelKind::NotThread | ChannelKind::Unknown => None,
+    };
+    cache.lock().await.observe(channel_id, kind, false);
+    parent
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct DiscordAdapterConfig {
     bot_token: Option<String>,
@@ -315,6 +532,8 @@ struct DiscordAdapterConfig {
     reconnect_max_secs: u32,
     #[serde(default = "DiscordAdapterConfig::prompt_timeout_secs")]
     prompt_timeout_secs: u32,
+    #[serde(default = "DiscordAdapterConfig::thread_cache_capacity")]
+    thread_cache_capacity: usize,
 }
 
 impl DiscordAdapterConfig {
@@ -351,6 +570,9 @@ impl DiscordAdapterConfig {
     fn prompt_timeout_secs() -> u32 {
         300
     }
+    fn thread_cache_capacity() -> usize {
+        1024
+    }
 }
 
 impl Default for DiscordAdapterConfig {
@@ -370,6 +592,7 @@ impl Default for DiscordAdapterConfig {
             reconnect_base_secs: Self::reconnect_base_secs(),
             reconnect_max_secs: Self::reconnect_max_secs(),
             prompt_timeout_secs: Self::prompt_timeout_secs(),
+            thread_cache_capacity: Self::thread_cache_capacity(),
         }
     }
 }
@@ -390,6 +613,7 @@ struct Tuning {
     reconnect_base_secs: u32,
     reconnect_max_secs: u32,
     prompt_timeout_secs: u32,
+    thread_cache_capacity: usize,
 }
 
 impl Default for Tuning {
@@ -406,6 +630,7 @@ impl Default for Tuning {
             reconnect_base_secs: DiscordAdapterConfig::reconnect_base_secs(),
             reconnect_max_secs: DiscordAdapterConfig::reconnect_max_secs(),
             prompt_timeout_secs: DiscordAdapterConfig::prompt_timeout_secs(),
+            thread_cache_capacity: DiscordAdapterConfig::thread_cache_capacity(),
         }
     }
 }
@@ -424,6 +649,7 @@ impl From<&DiscordAdapterConfig> for Tuning {
             reconnect_base_secs: cfg.reconnect_base_secs,
             reconnect_max_secs: cfg.reconnect_max_secs,
             prompt_timeout_secs: cfg.prompt_timeout_secs,
+            thread_cache_capacity: cfg.thread_cache_capacity,
         }
     }
 }
@@ -439,7 +665,7 @@ fn backfill_tuning_defaults() {
         .entry("module_specific".to_string())
         .or_insert_with(|| serde_json::json!({}));
     let Some(ms) = ms.as_object_mut() else { return };
-    let pairs: [(&str, serde_json::Value); 11] = [
+    let pairs: [(&str, serde_json::Value); 12] = [
         ("default_timeout_secs", serde_json::json!(DiscordAdapterConfig::default_timeout_secs())),
         ("http_timeout_secs", serde_json::json!(DiscordAdapterConfig::http_timeout_secs())),
         ("gateway_auth_backoff_base_secs", serde_json::json!(DiscordAdapterConfig::gateway_auth_backoff_base_secs())),
@@ -451,6 +677,7 @@ fn backfill_tuning_defaults() {
         ("reconnect_base_secs", serde_json::json!(DiscordAdapterConfig::reconnect_base_secs())),
         ("reconnect_max_secs", serde_json::json!(DiscordAdapterConfig::reconnect_max_secs())),
         ("prompt_timeout_secs", serde_json::json!(DiscordAdapterConfig::prompt_timeout_secs())),
+        ("thread_cache_capacity", serde_json::json!(DiscordAdapterConfig::thread_cache_capacity())),
     ];
     let mut changed = false;
     for (key, default) in pairs {
@@ -578,6 +805,7 @@ fn load_adapter_config() -> Option<DiscordAdapterConfig> {
         reconnect_base_secs: parsed.reconnect_base_secs,
         reconnect_max_secs: parsed.reconnect_max_secs,
         prompt_timeout_secs: parsed.prompt_timeout_secs,
+        thread_cache_capacity: parsed.thread_cache_capacity,
     })
     .filter(|c| !c.bot_token.as_deref().unwrap_or("").is_empty())
 }
@@ -623,6 +851,7 @@ fn setup_guide_text() -> String {
   3. Invite the bot to your server:
      OAuth2 -> URL Generator -> scopes: bot (+ applications.commands)
      Permissions: Read Messages, Send Messages, Moderate Members.
+     For threads also grant: Send Messages in Threads, Create Public Threads.
   4. Enable Developer Mode: Discord Settings -> Advanced -> Developer Mode.
      - Right-click your server -> Copy Server ID.
      - (Optional) Right-click a channel -> Copy Channel ID.
@@ -976,19 +1205,26 @@ async fn patch_webhook_avatar(
 }
 
 /// Execute a webhook (post `content` as the webhook's name+avatar). Mentions are
-/// suppressed so a proxied message cannot ping anyone.
+/// suppressed so a proxied message cannot ping anyone. `thread_id` is set when
+/// the target is a thread: Discord posts a channel webhook into a thread only
+/// via `?thread_id=<thread>` on the execute URL.
 async fn execute_webhook(
     client: &reqwest::Client,
     webhook_id: &str,
     webhook_token: &str,
+    thread_id: Option<&str>,
     content: &str,
     timeout_secs: u32,
 ) -> Result<(), String> {
+    let mut url = format!(
+        "{}/webhooks/{}/{}",
+        REST_API, webhook_id, webhook_token
+    );
+    if let Some(thread) = thread_id {
+        url.push_str(&format!("?thread_id={}", thread));
+    }
     let resp = client
-        .post(format!(
-            "{}/webhooks/{}/{}",
-            REST_API, webhook_id, webhook_token
-        ))
+        .post(url)
         .json(&json!({ "content": content, "allowed_mentions": { "parse": [] } }))
         .timeout(std::time::Duration::from_secs(timeout_secs as u64))
         .send()
@@ -1267,6 +1503,7 @@ fn tie_choices_help() -> String {
 /// MESSAGE_CREATE events to the engine as preprocessed messages. Receive-only:
 /// the token + servers/channels were resolved + validated in the linear setup
 /// phase, so this loop never prompts (no reconnect re-prompt spin).
+#[allow(clippy::too_many_arguments)]
 async fn run_discord_gateway(
     client: reqwest::Client,
     token: String,
@@ -1274,6 +1511,7 @@ async fn run_discord_gateway(
     engine_write: Arc<Mutex<WsWriteHalf>>,
     send_channels: Arc<Mutex<Vec<String>>>,
     identity: Arc<Mutex<EngineIdentity>>,
+    threads: Arc<Mutex<ThreadCache>>,
     tuning: &Tuning,
 ) {
     // Exponential backoff across repeated auth rejections (4004/4005/op 9):
@@ -1397,7 +1635,17 @@ async fn run_discord_gateway(
                             }
                             "MESSAGE_CREATE" => {
                                 if let Some(d) = d {
-                                    handle_message_create(d, &servers, &engine_write, &identity).await;
+                                    handle_message_create(
+                                        d,
+                                        &servers,
+                                        &engine_write,
+                                        &identity,
+                                        &client,
+                                        &token,
+                                        &threads,
+                                        tuning,
+                                    )
+                                    .await;
                                 }
                             }
                             _ => {}
@@ -1464,11 +1712,16 @@ fn extract_image_urls(d: &serde_json::Value) -> Vec<String> {
     urls
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_message_create(
     d: &serde_json::Value,
     servers: &std::collections::HashMap<String, ServerChannels>,
     engine_write: &Arc<Mutex<WsWriteHalf>>,
     identity: &Arc<Mutex<EngineIdentity>>,
+    client: &reqwest::Client,
+    token: &str,
+    threads: &Arc<Mutex<ThreadCache>>,
+    tuning: &Tuning,
 ) {
     let is_bot = d.get("author").and_then(|a| a.get("bot")).and_then(|b| b.as_bool()).unwrap_or(false);
     if is_bot {
@@ -1478,13 +1731,44 @@ async fn handle_message_create(
     // channel policy (`*`/bare = every channel in that server).
     let msg_guild = d.get("guild_id").and_then(|g| g.as_str()).unwrap_or("");
     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
-    let allowed = match servers.get(msg_guild) {
-        None => false,
-        Some(ServerChannels::All) => true,
-        Some(ServerChannels::Some(chs)) => chs.iter().any(|c| c == channel_id),
+    let policy = servers.get(msg_guild);
+
+    // A thread's `channel_id` is the thread, not its parent, so the policy is
+    // applied to the PARENT. A thread's starter message names the thread in the
+    // payload; for every other in-thread message the parent has to be resolved
+    // via REST (cached). `All` and directly-listed channels need neither, so
+    // they never take the round-trip (see `needs_parent_lookup`).
+    let payload_parent = thread_from_payload(d)
+        .filter(|(thread_id, _)| thread_id == channel_id)
+        .and_then(|(_, parent)| parent);
+    let parent_id = match payload_parent {
+        Some(parent) => Some(parent),
+        None if needs_parent_lookup(policy, channel_id) => {
+            resolve_thread_parent(
+                client,
+                REST_API,
+                token,
+                channel_id,
+                threads,
+                tuning.http_timeout_secs,
+            )
+            .await
+        }
+        None => None,
     };
+    let allowed = channel_allowed(policy, channel_id, parent_id.as_deref());
     if !allowed {
         return;
+    }
+    // Remember this channel as a valid explicit send target. A monitored
+    // parent's threads are NOT in the READY-resolved send list, so an engine
+    // reply into one would otherwise be dropped as "no matching channel".
+    {
+        let kind = match &parent_id {
+            Some(parent) => ChannelKind::Thread(parent.clone()),
+            None => ChannelKind::Unknown,
+        };
+        threads.lock().await.observe(channel_id, kind, true);
     }
     let author = d.get("author").and_then(|a| a.get("username")).and_then(|u| u.as_str()).unwrap_or("Unknown");
     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("").trim().to_string();
@@ -2277,6 +2561,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let send_token: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let send_channels: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let send_embed: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    // Bounded thread→parent cache shared by the gateway (policy + send targets)
+    // and the RP send path (webhook thread_id).
+    let threads: Arc<Mutex<ThreadCache>> = Arc::new(Mutex::new(ThreadCache::new(tuning.thread_cache_capacity)));
 
     // Channel carrying PromptResponses from the engine to the config loop, so
     // `prompt_for_input` can await the operator's typed answer.
@@ -2291,6 +2578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let token_state = send_token.clone();
         let channels_state = send_channels.clone();
         let embed_state = send_embed.clone();
+        let threads_state = threads.clone();
         let http = http.clone();
         let engine_write = engine_write.clone();
         let identity_task = identity.clone();
@@ -2309,32 +2597,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for _ in 0..tuning_task.send_worker_count {
                 let rx = send_rx.clone();
                 let webhook_cache = webhook_cache.clone();
+                let threads_worker = threads_state.clone();
                 tokio::spawn(async move {
                     while let Some(job) = { let mut guard = rx.lock().await; guard.recv().await } {
                         // A proxied job posts through the character's webhook;
                         // a normal job posts as the bot.
                         let posted = match &job.proxy {
-                            Some(proxy) => match ensure_webhook(
-                                &job.client,
-                                &job.token,
-                                &job.channel_id,
-                                &webhook_cache,
-                                proxy,
-                                job.http_timeout_secs,
-                            )
-                            .await
-                            {
-                                Ok((id, wtoken)) => execute_webhook(
+                            Some(proxy) => {
+                                // A proxied post into a thread must execute the
+                                // webhook with `?thread_id=<thread>` AND be
+                                // created on the PARENT channel (webhooks belong
+                                // to a channel; a parent's threads share its
+                                // 15-webhook limit). Resolve lazily (cached) here
+                                // so the gateway read loop never blocks on it.
+                                let parent = resolve_thread_parent(
                                     &job.client,
-                                    &id,
-                                    &wtoken,
-                                    &job.msg,
+                                    REST_API,
+                                    &job.token,
+                                    &job.channel_id,
+                                    &threads_worker,
+                                    job.http_timeout_secs,
+                                )
+                                .await;
+                                let create_channel =
+                                    parent.as_deref().unwrap_or(&job.channel_id);
+                                match ensure_webhook(
+                                    &job.client,
+                                    &job.token,
+                                    create_channel,
+                                    &webhook_cache,
+                                    proxy,
                                     job.http_timeout_secs,
                                 )
                                 .await
-                                .map(|()| format!("{} (as {})", job.msg, proxy.display_name)),
-                                Err(e) => Err(e),
-                            },
+                                {
+                                    Ok((id, wtoken)) => {
+                                        let thread_id =
+                                            parent.as_ref().map(|_| job.channel_id.as_str());
+                                        execute_webhook(
+                                            &job.client,
+                                            &id,
+                                            &wtoken,
+                                            thread_id,
+                                            &job.msg,
+                                            job.http_timeout_secs,
+                                        )
+                                        .await
+                                        .map(|()| {
+                                            format!("{} (as {})", job.msg, proxy.display_name)
+                                        })
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
                             None => send_discord_message(
                                 &job.client,
                                 &job.token,
@@ -2409,9 +2724,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let embed = *embed_state.lock().await;
                             // Target a single channel when the sender specified one
                             // (e.g. engine !help / invalid-command replies); else
-                            // send to every monitored channel.
+                            // send to every monitored channel. A monitored thread
+                            // isn't in the READY-resolved send list, so an explicit
+                            // reply into one is accepted via the thread cache.
                             let targets: Vec<String> = if !send.channel_id.is_empty() {
-                                channels.iter().filter(|c| **c == send.channel_id).cloned().collect()
+                                let known = channels.contains(&send.channel_id)
+                                    || threads_state
+                                        .lock()
+                                        .await
+                                        .is_monitored_target(&send.channel_id);
+                                if known {
+                                    vec![send.channel_id.clone()]
+                                } else {
+                                    Vec::new()
+                                }
                             } else {
                                 channels.clone()
                             };
@@ -2676,6 +3002,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_write,
         send_channels,
         identity,
+        threads,
         &tuning,
     )
     .await;
@@ -2684,7 +3011,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig, ensure_env_file_at, ENV_KEYS, bot_auth_value, build_http_client, check_discord_auth, retry_after_secs_from_body, describe_auth_failure, auth_retry_action, transient_backoff_secs, should_reset_rejection_budget, parse_servers_value, expand_guild_wildcard, plan_server_monitoring, ServerPlan, AuthAction, AuthFailure, MAX_AUTH_ATTEMPTS, guild_member_count_from_body, avatar_data_uri, webhook_cache_key};
+    use super::{merge_send_channels, parse_servers, ServerChannels, extract_image_urls, build_mod_query, parse_tie_choice, TieChoice, DiscordAdapterConfig, ensure_env_file_at, ENV_KEYS, bot_auth_value, build_http_client, check_discord_auth, retry_after_secs_from_body, describe_auth_failure, auth_retry_action, transient_backoff_secs, should_reset_rejection_budget, parse_servers_value, expand_guild_wildcard, plan_server_monitoring, ServerPlan, AuthAction, AuthFailure, MAX_AUTH_ATTEMPTS, guild_member_count_from_body, avatar_data_uri, webhook_cache_key, channel_allowed, needs_parent_lookup, is_thread_channel_type, thread_from_payload, thread_channel_from_object, ThreadCache, ChannelKind, resolve_thread_parent, Mutex};
     use serde_json::json;
     use wiremock::matchers::{header_regex, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2848,6 +3175,7 @@ mod tests {
         assert_eq!(cfg.reconnect_base_secs, 1);
         assert_eq!(cfg.reconnect_max_secs, 30);
         assert_eq!(cfg.prompt_timeout_secs, 300);
+        assert_eq!(cfg.thread_cache_capacity, 1024);
         // Explicit keys override the defaults.
         let cfg: DiscordAdapterConfig =
             serde_json::from_value(json!({ "http_timeout_secs": 9, "send_worker_count": 2 })).unwrap();
@@ -3473,5 +3801,221 @@ mod tests {
             None,
             "a non-integer member count is not parsed"
         );
+    }
+
+    // ── Threads: parent resolution + policy classification ───────────────
+
+    #[test]
+    fn thread_channel_types_are_ten_eleven_twelve() {
+        for ty in [10u64, 11, 12] {
+            assert!(is_thread_channel_type(ty), "{} is a thread type", ty);
+        }
+        // 0 text, 5 announcement, 13 stage voice, 15 forum are NOT threads.
+        for ty in [0u64, 1, 2, 4, 5, 13, 15] {
+            assert!(!is_thread_channel_type(ty), "{} is not a thread type", ty);
+        }
+    }
+
+    #[test]
+    fn a_thread_of_a_monitored_channel_is_allowed() {
+        let policy = ServerChannels::Some(vec!["parent".to_string()]);
+        // Non-thread behaviour is unchanged: the listed channel passes, an
+        // unlisted one doesn't.
+        assert!(channel_allowed(Some(&policy), "parent", None));
+        assert!(!channel_allowed(Some(&policy), "other", None));
+        // A thread is accepted when its PARENT is listed...
+        assert!(channel_allowed(Some(&policy), "thread-1", Some("parent")));
+        // ...and rejected when its parent is not.
+        assert!(!channel_allowed(Some(&policy), "thread-2", Some("other")));
+    }
+
+    #[test]
+    fn a_thread_of_an_unmonitored_channel_is_rejected() {
+        let policy = ServerChannels::Some(vec!["wanted".to_string()]);
+        assert!(!channel_allowed(Some(&policy), "thread", Some("not-wanted")));
+        // An unconfigured guild rejects threads outright.
+        assert!(!channel_allowed(None, "thread", Some("parent")));
+    }
+
+    #[test]
+    fn all_accepts_any_thread() {
+        assert!(channel_allowed(Some(&ServerChannels::All), "thread", Some("p")));
+        assert!(channel_allowed(Some(&ServerChannels::All), "thread", None));
+        assert!(channel_allowed(Some(&ServerChannels::All), "plain", None));
+    }
+
+    #[test]
+    fn a_thread_id_listed_directly_still_matches() {
+        // Regression guard: listing a thread id explicitly keeps working.
+        let policy = ServerChannels::Some(vec!["thread-x".to_string()]);
+        assert!(channel_allowed(Some(&policy), "thread-x", None));
+        assert!(channel_allowed(Some(&policy), "thread-x", Some("unlisted")));
+    }
+
+    #[test]
+    fn parent_lookup_only_for_unlisted_channels_in_a_configured_guild() {
+        let some = ServerChannels::Some(vec!["c".to_string()]);
+        assert!(!needs_parent_lookup(Some(&some), "c"), "listed channel");
+        assert!(needs_parent_lookup(Some(&some), "t"), "possibly a thread");
+        // All and an unconfigured guild never need a REST round-trip.
+        assert!(!needs_parent_lookup(Some(&ServerChannels::All), "t"));
+        assert!(!needs_parent_lookup(None, "t"));
+    }
+
+    #[test]
+    fn a_payload_thread_is_read_only_from_a_channel_object() {
+        // A thread's starter message carries the thread as a channel object.
+        let starter = json!({
+            "channel_id": "parent",
+            "type": 19,
+            "thread": { "id": "t1", "type": 11, "parent_id": "parent" }
+        });
+        assert_eq!(
+            thread_from_payload(&starter),
+            Some(("t1".to_string(), Some("parent".to_string())))
+        );
+
+        // The message's OWN `type` is a MessageType: 11 is GUILD_BOOST_TIER_3.
+        // It must NEVER be misread as a thread channel type (that was the trap
+        // in "type in {10,11,12}").
+        let boost = json!({ "channel_id": "c", "type": 11, "author": { "username": "x" } });
+        assert_eq!(thread_from_payload(&boost), None);
+
+        // No thread/channel object at all.
+        assert_eq!(thread_from_payload(&json!({ "channel_id": "c" })), None);
+    }
+
+    #[test]
+    fn a_channel_object_is_a_thread_only_when_its_type_says_so() {
+        assert_eq!(
+            thread_channel_from_object(&json!({ "id": "t", "type": 12, "parent_id": "p" })),
+            Some(("t".to_string(), Some("p".to_string())))
+        );
+        // A plain text channel is not a thread.
+        assert_eq!(thread_channel_from_object(&json!({ "id": "c", "type": 0 })), None);
+        // A thread without a parent still parses (parent unknown).
+        assert_eq!(
+            thread_channel_from_object(&json!({ "id": "t", "type": 10 })),
+            Some(("t".to_string(), None))
+        );
+        // A missing id can't be used.
+        assert_eq!(thread_channel_from_object(&json!({ "type": 11 })), None);
+    }
+
+    #[test]
+    fn thread_cache_bounds_and_reports_parents_and_targets() {
+        let mut cache = ThreadCache::new(2);
+        cache.observe("t1", ChannelKind::Thread("p".to_string()), true);
+        cache.observe("t2", ChannelKind::NotThread, true);
+        assert_eq!(cache.get("t1"), Some(&ChannelKind::Thread("p".to_string())));
+        assert!(cache.is_monitored_target("t1"));
+        assert!(cache.is_monitored_target("t2"));
+
+        // A third distinct entry evicts the oldest (t1), including its flag.
+        cache.observe("t3", ChannelKind::Thread("p2".to_string()), true);
+        assert!(cache.get("t1").is_none(), "oldest entry must be evicted");
+        assert!(!cache.is_monitored_target("t1"));
+        assert!(cache.is_monitored_target("t3"));
+    }
+
+    #[test]
+    fn a_later_resolution_never_clears_a_monitored_flag() {
+        // The All policy registers a channel without knowing it is a thread...
+        let mut cache = ThreadCache::new(4);
+        cache.observe("t", ChannelKind::NotThread, true);
+        // ...then a lazily-resolved parent must keep it a valid send target.
+        cache.observe("t", ChannelKind::Thread("p".to_string()), false);
+        assert!(cache.is_monitored_target("t"));
+        assert_eq!(cache.get("t"), Some(&ChannelKind::Thread("p".to_string())));
+    }
+
+    #[tokio::test]
+    async fn resolves_a_threads_parent_via_rest_and_caches_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/channels/thread-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "thread-1", "type": 11, "parent_id": "parent-1"
+            })))
+            .mount(&server)
+            .await;
+
+        let cache = std::sync::Arc::new(Mutex::new(ThreadCache::new(8)));
+        let client = build_http_client(5);
+        let parent = resolve_thread_parent(
+            &client,
+            &server.uri(),
+            "tok-123",
+            "thread-1",
+            &cache,
+            5,
+        )
+        .await;
+        assert_eq!(parent.as_deref(), Some("parent-1"));
+
+        // The second call is served from the cache: exactly ONE request.
+        let again = resolve_thread_parent(
+            &client,
+            &server.uri(),
+            "tok-123",
+            "thread-1",
+            &cache,
+            5,
+        )
+        .await;
+        assert_eq!(again.as_deref(), Some("parent-1"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_registered_channel_is_resolved_lazily() {
+        // The All/direct path registers a channel as Unknown (it passed the
+        // policy without a lookup). A later RP send must still resolve it —
+        // Unknown is NOT "definitively not a thread".
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/channels/thread-all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "thread-all", "type": 12, "parent_id": "parent-all"
+            })))
+            .mount(&server)
+            .await;
+
+        let cache = std::sync::Arc::new(Mutex::new(ThreadCache::new(8)));
+        cache
+            .lock()
+            .await
+            .observe("thread-all", ChannelKind::Unknown, true);
+        let client = build_http_client(5);
+        assert_eq!(
+            resolve_thread_parent(&client, &server.uri(), "tok", "thread-all", &cache, 5).await
+                .as_deref(),
+            Some("parent-all")
+        );
+        assert!(cache.lock().await.is_monitored_target("thread-all"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_plain_channel_resolves_to_no_parent_and_is_cached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/channels/plain-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "plain-1", "type": 0
+            })))
+            .mount(&server)
+            .await;
+
+        let cache = std::sync::Arc::new(Mutex::new(ThreadCache::new(8)));
+        let client = build_http_client(5);
+        assert_eq!(
+            resolve_thread_parent(&client, &server.uri(), "tok", "plain-1", &cache, 5).await,
+            None
+        );
+        // A non-thread result is cached as NotThread, so it is not re-queried.
+        assert_eq!(cache.lock().await.get("plain-1"), Some(&ChannelKind::NotThread));
+        let _ = resolve_thread_parent(&client, &server.uri(), "tok", "plain-1", &cache, 5).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

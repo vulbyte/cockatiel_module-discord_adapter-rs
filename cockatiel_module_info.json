@@ -46,7 +46,7 @@
       "sensitive": false
     }
   ],
-  "description": "reads + sends Discord chat and mod commands. Needs a bot token + Server ID (enable the Message Content intent and invite the bot with Read/Send/Moderate perms).",
+  "description": "reads + sends Discord chat and mod commands. Needs a bot token + Server ID (enable the Message Content intent and invite the bot with Read/Send/Moderate perms; for threads also Send Messages in Threads + Create Public Threads).",
   "launch_command": "cargo",
   "min_rank": 0,
   "name": "discord-adapter",
